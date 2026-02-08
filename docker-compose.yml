@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  test_runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: test_runner
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - .:/app
+      - /app/.venv
+    command: >
+      sh -c "
+        pip install --no-cache-dir -r requirements.txt && python test7.py && python test.py && python test2.py && python test3.py && python test4.py && python test5.py && python test6.py && test7.py && test8.py 
+      "
+    networks:
+      - test_network
+
+networks:
+  test_network:
+    driver: bridge

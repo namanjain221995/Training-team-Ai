@@ -1,0 +1,14 @@
+mediapipe==0.10.14
+opencv-python==4.10.0.84
+numpy==1.26.4
+pandas==2.2.2
+python-dotenv==1.0.1
+openai==1.63.0
+google-api-python-client==2.160.0
+google-auth==2.38.0
+google-auth-oauthlib==1.2.1
+requests==2.32.3
+openpyxl==3.1.5
+onnxruntime==1.20.1
+insightface==0.7.3
+tqdm==4.67.1

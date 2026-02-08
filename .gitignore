@@ -1,0 +1,24 @@
+﻿token*.json
+credentials*.json
+.openai_file_cache.json
+.vscode/
+__pycache__/
+*.pyc
+.venv312
+.venv
+models/*.onnx
+models/**.onnx
+.env
+
+# Secrets
+gmail_token.json
+*.token.json
+token.json
+
+
+# Secrets
+gmail_token.json
+token.json
+*.token.json
+.env
+

@@ -1,0 +1,12 @@
+.venv
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+.env
+.env.local
+token.json
+credentials.json
+31-Questions.pdf
+.openai_file_cache.json
