@@ -45,10 +45,10 @@ GDOC_MIME = "application/vnd.google-apps.document"
 PERSON_DOC_NAME = "Deliverables Analysis"
 SLOT_DOC_NAME = "All Deliverables Analysis"
 
-# Skip folders under 2026/<Slot>/ that are NOT people folders
+#Skip folders under 2026/<Slot>/ that are NOT people folders
 SKIP_PERSON_FOLDERS = {"1. Format"}
 
-# Give editor access to these emails (folder + doc)
+#Give editor access to these emails (folder + doc)
 EDITOR_EMAILS = [
     "rajvi.patel@techsarasolutions.com",
     "sahil.patel@techsarasolutions.com",
