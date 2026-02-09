@@ -4,7 +4,7 @@ from pathlib import Path
 ENV_PATH = Path(".env")
 
 # ===== HARD-CODE SLOT HERE =====
-SLOT_CHOICE = "1"   # change this to 1/2/3..
+SLOT_CHOICE = "3"   # change this to 1/2/3..
 # ===============================
 
 def update_env_var(path: Path, key: str, value: str) -> None:

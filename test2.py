@@ -63,8 +63,6 @@ FOLDER_TO_PROMPT = {
     "6. 30 Questions Related to Their Niche": "niche-prompt.txt",
     "7. 50 Questions Related to the Resume": "CV-prompt.txt",
     "8. Tools & Technology Videos": "Tools-Technology-prompt.txt",
-
-    #NEW folders you created in Drive
     "9. System Design Video (with Draw.io)": "System-design.txt",
     "10. Persona Video": "persona.txt",
     "11. Small Talk": "smalltalk.txt",
@@ -77,8 +75,6 @@ PROMPT_NEEDS_CV = {
     "niche-prompt.txt",
     "CV-prompt.txt",
     "Tools-Technology-prompt.txt",
-
-    # NEW: Persona & JD prompts should be resume-grounded
     "persona.txt",
     "JD-prompt.txt",
 }
