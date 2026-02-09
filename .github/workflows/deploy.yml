@@ -1,0 +1,133 @@
+name: EC2 Deploy (Detached)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ec2-deploy-main
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Ensure EC2 is running (handle stopping/pending)
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+
+          STATE="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text)"
+
+          echo "Current state: $STATE"
+
+          # If it's stopping, wait for stopped first
+          if [ "$STATE" = "stopping" ]; then
+            echo "Instance is stopping. Waiting for it to stop..."
+            aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+            STATE="stopped"
+            echo "Now state: $STATE"
+          fi
+
+          # If it's pending, wait for running
+          if [ "$STATE" = "pending" ]; then
+            echo "Instance is pending. Waiting for running..."
+            aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+            echo "EC2 running."
+            exit 0
+          fi
+
+          # If it's running already, nothing to do
+          if [ "$STATE" = "running" ]; then
+            echo "EC2 already running."
+            exit 0
+          fi
+
+          # If stopped, start it
+          if [ "$STATE" = "stopped" ]; then
+            echo "Starting EC2..."
+            aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
+            aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+            echo "EC2 running."
+            exit 0
+          fi
+
+          # Other states: shutting-down/terminated etc.
+          echo "ERROR: Instance is in unexpected state: $STATE"
+          exit 1
+
+      - name: Get EC2 Public IP
+        id: ec2ip
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          IP="$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)"
+          if [ "$IP" = "None" ] || [ -z "$IP" ]; then
+            echo "ERROR: No public IP."
+            exit 1
+          fi
+          echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "EC2 Public IP: $IP"
+
+      - name: Wait for SSH (port 22)
+        run: |
+          set -euo pipefail
+          HOST="${{ steps.ec2ip.outputs.public_ip }}"
+          echo "Waiting for SSH on $HOST:22 ..."
+          for i in {1..120}; do
+            if nc -z -w 5 "$HOST" 22; then
+              echo "SSH reachable."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERROR: SSH not reachable."
+          exit 1
+
+      - name: Deploy + run detached (call run_detached.sh)
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          EC2_PATH: ${{ secrets.EC2_PATH }}
+        with:
+          host: ${{ steps.ec2ip.outputs.public_ip }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script_stop: true
+          command_timeout: 30m
+          envs: EC2_PATH
+          script: |
+            set -euo pipefail
+
+            cd "$EC2_PATH"
+
+            echo "== Update code =="
+            git fetch --all
+            git reset --hard origin/main
+
+            echo "== Ensure docker running =="
+            sudo systemctl enable docker || true
+            sudo systemctl start docker || true
+
+            echo "== Ensure run_detached.sh executable =="
+            chmod +x run_detached.sh
+
+            echo "== Start pipeline detached =="
+            ./run_detached.sh

@@ -15,7 +15,7 @@ services:
       - /app/.venv
     command: >
       sh -c "
-        pip install --no-cache-dir -r requirements.txt && python script.py && python test.py && python test8.py 
+        pip install --no-cache-dir -r requirements.txt && python script.py && python final-mail.py   
       "
     networks:
       - test_network

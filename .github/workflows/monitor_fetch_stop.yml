@@ -1,0 +1,161 @@
+name: EC2 Monitor -> Stop Docker -> Stop EC2
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: ec2-monitor-stop
+  cancel-in-progress: false
+
+jobs:
+  monitor_stop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Get instance state
+        id: state
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          STATE="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text)"
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+          echo "Instance state: $STATE"
+
+      - name: Exit if instance not running
+        if: steps.state.outputs.state != 'running'
+        run: |
+          echo "Instance not running. Nothing to do."
+          exit 0
+
+      - name: Get EC2 Public IP
+        id: ec2ip
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          IP="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+          if [ "$IP" = "None" ] || [ -z "$IP" ]; then
+            echo "No public IP. Exiting safely."
+            exit 0
+          fi
+          echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "EC2 IP: $IP"
+
+      - name: Wait for SSH (port 22)
+        run: |
+          set -euo pipefail
+          HOST="${{ steps.ec2ip.outputs.public_ip }}"
+          for i in {1..24}; do
+            if nc -z -w 5 "$HOST" 22; then
+              echo "SSH reachable."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "SSH not reachable. Exiting safely."
+          exit 0
+
+      - name: Decide if safe to stop (ONLY stop when container finished)
+        id: decide
+        run: |
+          set -euo pipefail
+          HOST="${{ steps.ec2ip.outputs.public_ip }}"
+          USER="${{ secrets.EC2_USER }}"
+          EC2_PATH="${{ secrets.EC2_PATH }}"
+
+          KEY_FILE="$(mktemp)"
+          echo "${{ secrets.EC2_SSH_KEY }}" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+          OUT="$(ssh -o StrictHostKeyChecking=no -i "$KEY_FILE" "$USER@$HOST" "
+            set -euo pipefail
+            cd '$EC2_PATH'
+
+            if [ ! -f LAST_RUN_ID ]; then
+              echo 'SAFE_STOP=false REASON=no_LAST_RUN_ID'
+              exit 0
+            fi
+
+            RUN_ID=\$(cat LAST_RUN_ID)
+
+            if [ ! -f runs/\$RUN_ID/container_id.txt ]; then
+              echo 'SAFE_STOP=false REASON=missing_container_id'
+              exit 0
+            fi
+
+            CID=\$(cat runs/\$RUN_ID/container_id.txt)
+            RUNNING=\$(docker inspect -f '{{.State.Running}}' \"\$CID\" 2>/dev/null || echo 'missing')
+
+            if [ \"\$RUNNING\" = 'true' ]; then
+              echo 'SAFE_STOP=false REASON=container_running'
+              exit 0
+            fi
+
+            # container not running -> require exit_code marker
+            if [ -f runs/\$RUN_ID/exit_code.txt ]; then
+              echo 'SAFE_STOP=true REASON=container_stopped_and_exit_code_exists'
+            else
+              echo 'SAFE_STOP=false REASON=container_stopped_but_exit_code_missing'
+            fi
+          " || true)"
+
+          echo "$OUT"
+
+          if echo "$OUT" | grep -q 'SAFE_STOP=true'; then
+            echo "safe_stop=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "safe_stop=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Exit if not safe to stop
+        if: steps.decide.outputs.safe_stop != 'true'
+        run: |
+          echo "Not safe to stop yet (docker still running or markers missing)."
+          exit 0
+
+      - name: Stop docker compose on EC2 (cleanup)
+        if: steps.decide.outputs.safe_stop == 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          EC2_PATH: ${{ secrets.EC2_PATH }}
+        with:
+          host: ${{ steps.ec2ip.outputs.public_ip }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script_stop: false
+          command_timeout: 15m
+          envs: EC2_PATH
+          script: |
+            set -euo pipefail
+            cd "$EC2_PATH"
+            if command -v docker-compose >/dev/null 2>&1; then
+              docker-compose down || true
+            elif docker compose version >/dev/null 2>&1; then
+              docker compose down || true
+            fi
+            echo "Compose cleanup done."
+
+      - name: Stop EC2 instance
+        if: steps.decide.outputs.safe_stop == 'true'
+        run: |
+          set -euo pipefail
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          echo "Stopping EC2..."
+          aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
+          aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+          echo "EC2 stopped."
