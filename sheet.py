@@ -101,10 +101,10 @@ THRESHOLDS_PCT: Dict[str, float] = {
     "6. 30 Questions Related to Their Niche": 60.0,
     "7. 50 Questions Related to the Resume": 80.0,
     "8. Tools & Technology Videos": 70.0,
-    "9. System Design Video (with Draw.io)",
-    "10. Persona Video",
-    "11. Small Talk",
-    "12. JD Video",
+    "9. System Design Video (with Draw.io)": 80.0,
+    "10. Persona Video": 70.0,
+    "11. Small Talk": 75.0,
+    "12. JD Video": 75.0,
     AVG_HEADER: 75.0,
 }
 
