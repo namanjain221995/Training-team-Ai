@@ -7,6 +7,7 @@ import tempfile
 import subprocess
 import contextlib
 import wave
+import re
 from pathlib import Path
 from typing import Optional, List
 
@@ -55,6 +56,10 @@ CHUNK_SECONDS = 540  # 9 minutes
 OVERLAP_SECONDS = 2
 API_URL = "https://api.openai.com/v1/audio/transcriptions"
 
+# Transcript output naming
+# Video: Foo.mp4  -> Foo_transcripts.txt
+TRANSCRIPT_SUFFIX = "_transcripts.txt"
+
 # Google Drive OAuth
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 CREDENTIALS_FILE = Path("credentials.json")
@@ -70,6 +75,30 @@ SLOT_CHOICE_ENV = (os.getenv("SLOT_CHOICE") or "").strip()
 api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
 if not api_key:
     raise RuntimeError("OPENAI_API_KEY not set. Put it in .env as OPENAI_API_KEY=...")
+
+# =========================
+# WINDOWS-SAFE LOCAL FILENAMES
+# =========================
+_WINDOWS_FORBIDDEN = r'<>:"/\\|?*'
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+def safe_local_filename(name: str, fallback: str = "file.bin") -> str:
+    name = (name or "").strip() or fallback
+    name = re.sub(f"[{re.escape(_WINDOWS_FORBIDDEN)}]", "_", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    name = name.rstrip(" .")
+    stem, dot, ext = name.partition(".")
+    if stem.upper() in _WINDOWS_RESERVED:
+        stem = f"_{stem}"
+    name = stem + (dot + ext if dot else "")
+    return name or fallback
+
+def transcript_output_name(video_name: str) -> str:
+    return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
 
 # =========================
 # RETRY WRAPPER (Drive API)
@@ -174,7 +203,7 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
 
 def drive_download_file(service, file_id: str, dest_path: Path):
     request = service.files().get_media(fileId=file_id, **_get_media_kwargs())
-    with io.FileIO(dest_path, "wb") as fh:
+    with io.FileIO(str(dest_path), "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 8)
         done = False
         while not done:
@@ -453,7 +482,6 @@ def main():
             if not target:
                 continue
 
-            # Upload transcripts directly into the SAME deliverable folder
             out_folder_id = target["id"]
 
             children = list(drive_list_children(service, target["id"], None))
@@ -472,20 +500,25 @@ def main():
 
             for vid in videos:
                 total += 1
-                out_txt_name = f"{Path(vid['name']).stem}.txt"
+
+                out_txt_name = transcript_output_name(vid["name"])
 
                 existing_out = drive_find_child(service, out_folder_id, out_txt_name, None)
                 if existing_out and not FORCE_RETRANSCRIBE:
                     skipped += 1
-                    print(f"  [SKIP] {vid['name']} -> transcript exists")
+                    print(f"  [SKIP] {vid['name']} -> {out_txt_name} exists")
                     continue
 
                 try:
                     with tempfile.TemporaryDirectory() as td:
                         td = Path(td)
-                        local_video = td / vid["name"]
-                        local_wav = td / f"{Path(vid['name']).stem}__tmp.wav"
-                        local_txt = td / out_txt_name
+
+                        safe_vid_name = safe_local_filename(vid["name"], "video.mp4")
+                        safe_txt_name = safe_local_filename(out_txt_name, out_txt_name)
+
+                        local_video = td / safe_vid_name
+                        local_wav = td / f"{Path(safe_vid_name).stem}__tmp.wav"
+                        local_txt = td / safe_txt_name
 
                         print(f"  [DL  ] {vid['name']} -> downloading")
                         drive_download_file(service, vid["id"], local_video)
