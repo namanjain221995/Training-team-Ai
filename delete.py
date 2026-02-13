@@ -35,6 +35,10 @@ FOLDER_NAMES_TO_PROCESS = [
     "6. 30 Questions Related to Their Niche",
     "7. 50 Questions Related to the Resume",
     "8. Tools & Technology Videos",
+    "9. System Design Video (with Draw.io)",
+    "10. Persona Video",
+    "11. Small Talk",
+    "12. JD Video",
 ]
 
 SKIP_PERSON_FOLDERS = {"1. Format"}
