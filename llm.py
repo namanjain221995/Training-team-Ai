@@ -84,6 +84,7 @@ PROMPT_NEEDS_CV = {
     "Tools-Technology-prompt.txt",
     "persona.txt",
     "JD-prompt.txt",
+    "System-design.txt",
 }
 
 # Prompts that require diagram images from SAME deliverable folder
