@@ -88,7 +88,7 @@ PROMPT_NEEDS_CV = {
 }
 
 # Prompts that require diagram images from SAME deliverable folder
-# (We will attach as input_image base64, not input_file)
+# We attach as input_image (base64 data URL)
 PROMPT_NEEDS_PNG = {
     "Tools-Technology-prompt.txt",
     "System-design.txt",
@@ -515,7 +515,7 @@ def openai_upload_file(path: Path, mime: str, cache: OpenAIFileCache) -> str:
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
     files = {"file": (path.name, open(path, "rb"), mime)}
-    data = {"purpose": "user_data"}
+    data = {"purpose": OPENAI_FILE_PURPOSE}
 
     r = request_with_retries(requests.post, OPENAI_FILES_URL, headers=headers, files=files, data=data, timeout=600)
     if r.status_code not in (200, 201):
@@ -528,11 +528,14 @@ def openai_upload_file(path: Path, mime: str, cache: OpenAIFileCache) -> str:
 def openai_upload_pdf(path: Path, cache: OpenAIFileCache) -> str:
     return openai_upload_file(path, "application/pdf", cache)
 
+# ✅ FIXED: image_url must be a STRING (URL or data URL), not an object {"url": ...}
 def png_to_input_image_part(png_path: Path) -> dict:
-    b = png_path.read_bytes()
-    b64 = base64.b64encode(b).decode("utf-8")
-    data_url = f"data:image/png;base64,{b64}"
-    return {"type": "input_image", "image_url": {"url": data_url}}
+    b64 = base64.b64encode(png_path.read_bytes()).decode("utf-8")
+    return {
+        "type": "input_image",
+        "image_url": f"data:image/png;base64,{b64}",
+        # "detail": "auto",  # optional
+    }
 
 def openai_run_prompt(
     prompt_text: str,
