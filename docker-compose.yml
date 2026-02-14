@@ -15,7 +15,7 @@ services:
       - /app/.venv
     command: >
       sh -c "
-        pip install --no-cache-dir -r requirements.txt && python script.py && python transcript.py && python llm.py && python each-personscore-docs.py && python docs.py && python sheet.py && python eye-tracker.py && python eye-docs.py && python eye-sheet.py && python final-mail.py   
+        pip install --no-cache-dir -r requirements.txt && python script.py && python llm.py && python each-personscore-docs.py && python docs.py && python sheet.py && python eye-tracker.py && python eye-docs.py && python eye-sheet.py && python final-mail.py   
       "
     networks:
       - test_network
