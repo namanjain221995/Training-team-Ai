@@ -92,6 +92,7 @@ PROMPT_NEEDS_CV = {
 PROMPT_NEEDS_PNG = {
     "Tools-Technology-prompt.txt",
     "System-design.txt",
+    "JD-prompt.txt",
 }
 
 # ============================================================

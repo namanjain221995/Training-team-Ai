@@ -1,9 +1,14 @@
+import random
 import re
+import socket
+import ssl
 import time
 from pathlib import Path
 from typing import Optional, List
 
+import httplib2
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
@@ -29,15 +34,7 @@ GDOC_MIME = "application/vnd.google-apps.document"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 FOLDER_NAMES_TO_PROCESS = [
-    "3. Introduction Video",
-    "4. Mock Interview (First Call)",
-    "5. Project Scenarios",
-    "6. 30 Questions Related to Their Niche",
-    "7. 50 Questions Related to the Resume",
-    "8. Tools & Technology Videos",
-    "9. System Design Video (with Draw.io)",
-    "10. Persona Video",
-    "11. Small Talk",
+    
     "12. JD Video",
 ]
 
@@ -85,6 +82,37 @@ SCRIPT_OUTPUTS = {
 
 
 # =========================
+# Robust Drive execute retry
+# =========================
+def drive_execute_with_retry(request, *, max_retries: int = 8, base_sleep: float = 1.0):
+    """
+    Robust retry for Drive API calls.
+    Retries on:
+      - transient network errors/timeouts
+      - HTTP 429 (rate limit)
+      - HTTP 5xx (transient server errors)
+    """
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return request.execute()
+        except (TimeoutError, socket.timeout, ssl.SSLError, ConnectionError, httplib2.HttpLib2Error) as e:
+            last_exc = e
+        except HttpError as e:
+            last_exc = e
+            status = getattr(e.resp, "status", None)
+            if status not in (429, 500, 502, 503, 504):
+                raise
+
+        sleep_s = base_sleep * (2 ** attempt) + random.uniform(0, 0.5)
+        time.sleep(min(sleep_s, 30))
+
+    if isinstance(last_exc, TimeoutError):
+        raise last_exc
+    raise TimeoutError(f"Drive API request failed after retries. Last error: {last_exc}")
+
+
+# =========================
 # Google Drive Auth
 # =========================
 def get_drive_service():
@@ -128,17 +156,14 @@ def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
     out: List[dict] = []
     page_token = None
     while True:
-        res = (
-            service.files()
-            .list(
-                q=q,
-                fields="nextPageToken, files(id,name,parents,modifiedTime)",
-                pageSize=100,
-                pageToken=page_token,
-                **_list_kwargs(),
-            )
-            .execute()
+        req = service.files().list(
+            q=q,
+            fields="nextPageToken, files(id,name,parents,modifiedTime)",
+            pageSize=100,
+            pageToken=page_token,
+            **_list_kwargs(),
         )
+        res = drive_execute_with_retry(req)
 
         out.extend(res.get("files", []))
         page_token = res.get("nextPageToken")
@@ -162,17 +187,14 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
 
     page_token = None
     while True:
-        res = (
-            service.files()
-            .list(
-                q=q,
-                fields="nextPageToken, files(id,name,mimeType,modifiedTime)",
-                pageSize=1000,
-                pageToken=page_token,
-                **_list_kwargs(),
-            )
-            .execute()
+        req = service.files().list(
+            q=q,
+            fields="nextPageToken, files(id,name,mimeType,modifiedTime)",
+            pageSize=500,
+            pageToken=page_token,
+            **_list_kwargs(),
         )
+        res = drive_execute_with_retry(req)
 
         for f in res.get("files", []):
             yield f
@@ -190,15 +212,11 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
         q_parts.append(f"mimeType = '{mime_type}'")
     q = " and ".join(q_parts)
 
-    res = (
-        service.files()
-        .list(q=q, fields="files(id,name,mimeType,modifiedTime)", pageSize=50, **_list_kwargs())
-        .execute()
-    )
+    req = service.files().list(q=q, fields="files(id,name,mimeType,modifiedTime)", pageSize=50, **_list_kwargs())
+    res = drive_execute_with_retry(req)
     files = res.get("files", []) or []
     if not files:
         return None
-    # pick most recent if duplicates
     files.sort(key=lambda x: (x.get("modifiedTime") or ""), reverse=True)
     return files[0]
 
@@ -206,7 +224,8 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
 def drive_delete_file(service, file_id: str, file_name: str) -> bool:
     """Delete a file by ID."""
     try:
-        service.files().delete(fileId=file_id, **_delete_kwargs()).execute()
+        req = service.files().delete(fileId=file_id, **_delete_kwargs())
+        drive_execute_with_retry(req)
         print(f"  ✓ Deleted: {file_name}")
         return True
     except Exception as e:
@@ -218,15 +237,12 @@ def drive_delete_file(service, file_id: str, file_name: str) -> bool:
 # Output location helpers (ONLY for test4/test5)
 # =========================
 def drive_get_folder_by_id(service, folder_id: str) -> dict:
-    return (
-        service.files()
-        .get(
-            fileId=folder_id,
-            fields="id,name,mimeType,parents,modifiedTime",
-            **_list_kwargs(),
-        )
-        .execute()
+    req = service.files().get(
+        fileId=folder_id,
+        fields="id,name,mimeType,parents,modifiedTime",
+        **_list_kwargs(),
     )
+    return drive_execute_with_retry(req)
 
 
 def resolve_output_root_folder(service) -> Optional[dict]:
@@ -318,6 +334,18 @@ def iter_target_slots(service, slots_parent_id: str, only_slot: Optional[dict]):
             yield s
 
 
+def iter_people(service, slot_id: str) -> List[dict]:
+    """List people folders under a slot (skipping SKIP_PERSON_FOLDERS)."""
+    return sorted(
+        [
+            p
+            for p in drive_list_children(service, slot_id, FOLDER_MIME)
+            if (p.get("name") or "").strip() not in SKIP_PERSON_FOLDERS
+        ],
+        key=lambda x: (x.get("name") or "").lower(),
+    )
+
+
 # =========================
 # Deletion functions for each script
 # =========================
@@ -331,12 +359,7 @@ def delete_test1_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     pattern = re.compile(r"^[^/]*\.txt$", re.IGNORECASE)
 
     for slot in iter_target_slots(service, slots_parent_id, only_slot):
-        people = sorted(
-            list(drive_list_children(service, slot["id"], FOLDER_MIME)),
-            key=lambda x: (x.get("name") or "").lower(),
-        )
-
-        for person in people:
+        for person in iter_people(service, slot["id"]):
             for folder_name in FOLDER_NAMES_TO_PROCESS:
                 target = drive_find_child(service, person["id"], folder_name, FOLDER_MIME)
                 if not target:
@@ -370,12 +393,7 @@ def delete_test2_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     pattern = re.compile(r"^LLM_OUTPUT__.*\.txt$", re.IGNORECASE)
 
     for slot in iter_target_slots(service, slots_parent_id, only_slot):
-        people = sorted(
-            list(drive_list_children(service, slot["id"], FOLDER_MIME)),
-            key=lambda x: (x.get("name") or "").lower(),
-        )
-
-        for person in people:
+        for person in iter_people(service, slot["id"]):
             for folder_name in FOLDER_NAMES_TO_PROCESS:
                 target = drive_find_child(service, person["id"], folder_name, FOLDER_MIME)
                 if not target:
@@ -383,9 +401,7 @@ def delete_test2_outputs(service, slots_parent_id: str, only_slot: Optional[dict
 
                 files = list(drive_list_children(service, target["id"], None))
                 llm_files = [
-                    f
-                    for f in files
-                    if f.get("mimeType") != FOLDER_MIME and pattern.match(f.get("name") or "")
+                    f for f in files if f.get("mimeType") != FOLDER_MIME and pattern.match(f.get("name") or "")
                 ]
 
                 if llm_files:
@@ -406,16 +422,7 @@ def delete_test3_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     deleted_count = 0
 
     for slot in iter_target_slots(service, slots_parent_id, only_slot):
-        people = sorted(
-            [
-                p
-                for p in drive_list_children(service, slot["id"], FOLDER_MIME)
-                if (p.get("name") or "").strip() not in SKIP_PERSON_FOLDERS
-            ],
-            key=lambda x: (x.get("name") or "").lower(),
-        )
-
-        for person in people:
+        for person in iter_people(service, slot["id"]):
             doc = drive_find_child(service, person["id"], "Deliverables Analysis", GDOC_MIME)
             if doc:
                 print(f"[{slot['name']}] {person['name']}")
@@ -505,15 +512,7 @@ def delete_test6_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     )
 
     for slot in iter_target_slots(service, slots_parent_id, only_slot):
-        people = sorted(
-            [
-                p for p in drive_list_children(service, slot["id"], FOLDER_MIME)
-                if (p.get("name") or "").strip() not in SKIP_PERSON_FOLDERS
-            ],
-            key=lambda x: (x.get("name") or "").lower(),
-        )
-
-        for person in people:
+        for person in iter_people(service, slot["id"]):
             for folder_name in FOLDER_NAMES_TO_PROCESS:
                 target = drive_find_child(service, person["id"], folder_name, FOLDER_MIME)
                 if not target:
@@ -521,9 +520,9 @@ def delete_test6_outputs(service, slots_parent_id: str, only_slot: Optional[dict
 
                 files = list(drive_list_children(service, target["id"], None))
                 eye_files = [
-                    f for f in files
-                    if f.get("mimeType") != FOLDER_MIME
-                    and pattern.match(f.get("name") or "")
+                    f
+                    for f in files
+                    if f.get("mimeType") != FOLDER_MIME and pattern.match(f.get("name") or "")
                 ]
 
                 if eye_files:
@@ -574,7 +573,9 @@ def main():
     base_2026 = pick_best_named_folder(candidates)
     slots_parent_id = base_2026["id"]
 
-    print(f"\nUsing 2026 folder: {base_2026['name']} (id={base_2026['id']}, modified={base_2026.get('modifiedTime')})")
+    print(
+        f"\nUsing 2026 folder: {base_2026['name']} (id={base_2026['id']}, modified={base_2026.get('modifiedTime')})"
+    )
 
     show_menu()
     choice = get_user_choice()
