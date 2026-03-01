@@ -22,10 +22,12 @@ LAUNCH_TEMPLATE_ID = os.getenv("WORKER_LAUNCH_TEMPLATE_ID", "").strip()
 LAUNCH_TEMPLATE_VERSION = os.getenv("WORKER_LAUNCH_TEMPLATE_VERSION", "$Default")
 
 ROOT_2026_FOLDER_NAME = os.getenv("ROOT_2026_FOLDER_NAME", "2026")
-SLOT_CHOICE = os.getenv("SLOT_CHOICE", "4").strip()  # 1-based index
-USE_SHARED_DRIVES = os.getenv("USE_SHARED_DRIVES", "").strip().lower() in ("1", "true", "yes", "y")
+SLOT_CHOICE = os.getenv("SLOT_CHOICE", "").strip()  # 1-based index
+USE_SHARED_DRIVES = os.getenv("USE_SHARED_DRIVES", "0").strip().lower() in ("1", "true", "yes", "y")
 
 TOKEN_FILE = Path(os.getenv("TOKEN_FILE", "token.json"))
+TOKEN_FILE_WRITE = Path(os.getenv("TOKEN_FILE_WRITE", "/app/state/token_refreshed.json"))
+
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
@@ -51,7 +53,7 @@ LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.25"))
 # Wait behavior
 WAIT_POLL_SECONDS = int(os.getenv("WAIT_POLL_SECONDS", "15"))
 
-# Unique RunId tag for this run (helps waiting only for current run’s workers)
+# Unique RunId tag for this run
 RUN_ID = os.getenv("RUN_ID", "") or time.strftime("%Y%m%d_%H%M%S")
 
 # -----------------------------
@@ -70,17 +72,24 @@ def _list_kwargs():
 def build_drive():
     """
     Non-interactive Drive auth on main EC2:
-    - token.json must exist and contain refresh_token, client_id, client_secret.
+    token.json must exist (mounted read-only is OK).
+    If refresh happens, we write refreshed token to TOKEN_FILE_WRITE (writable).
     """
     if not TOKEN_FILE.exists():
         raise RuntimeError(f"token.json not found at {TOKEN_FILE}. Mount it into orchestrator container.")
 
     creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
 
-    # refresh token if needed
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+
+        # token.json is mounted read-only; write refreshed token elsewhere
+        try:
+            TOKEN_FILE_WRITE.parent.mkdir(parents=True, exist_ok=True)
+            TOKEN_FILE_WRITE.write_text(creds.to_json(), encoding="utf-8")
+            print(f"[AUTH] Token refreshed; wrote updated token to {TOKEN_FILE_WRITE} (original token.json is read-only).")
+        except Exception as e:
+            print(f"[AUTH] Token refreshed but could not write refreshed token: {e}")
 
     return build("drive", "v3", credentials=creds)
 
@@ -194,8 +203,8 @@ def find_tasks(drive) -> List[Dict]:
 
 # -----------------------------
 # Launch workers (per video)
-# Worker Launch Template contains the real logic (docker build/pull + run test2 + terminate).
-# We override only to inject VIDEO_FILE_ID/TARGET_FOLDER_ID/VIDEO_NAME.
+# Worker Launch Template contains the real logic (docker build/run test2 + terminate).
+# We override only to inject VIDEO_FILE_ID / TARGET_FOLDER_ID / VIDEO_NAME.
 # -----------------------------
 USERDATA_INJECT_ONLY = """#!/bin/bash
 set -euo pipefail

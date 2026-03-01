@@ -14,23 +14,21 @@ services:
       - AWS_EC2_METADATA_DISABLED=false
 
       - WORKER_LAUNCH_TEMPLATE_ID=${WORKER_LAUNCH_TEMPLATE_ID}
-      - WORKER_LAUNCH_TEMPLATE_VERSION=${WORKER_LAUNCH_TEMPLATE_VERSION:-$Default}
-      - WORKER_LOG_GROUP=/transcription/workers
+      - WORKER_LAUNCH_TEMPLATE_VERSION=${WORKER_LAUNCH_TEMPLATE_VERSION}
 
+      - WORKER_LOG_GROUP=/transcription/workers
       - SLOT_CHOICE=${SLOT_CHOICE}
       - ROOT_2026_FOLDER_NAME=${ROOT_2026_FOLDER_NAME:-2026}
       - USE_SHARED_DRIVES=${USE_SHARED_DRIVES:-0}
 
       - TOKEN_FILE=/app/token.json
-      - CREDENTIALS_FILE=/app/credentials.json
-      - HEADLESS_AUTH=1
-
-      - SHUTDOWN_AFTER=${SHUTDOWN_AFTER:-1}
+      - TOKEN_FILE_WRITE=/app/state/token_refreshed.json
 
     volumes:
       - ./:/app
       - ./token.json:/app/token.json:ro
       - ./credentials.json:/app/credentials.json:ro
+      - gdrive_state:/app/state
 
     command: ["python", "main_ec2_pipeline.py"]
 
@@ -57,7 +55,6 @@ services:
       - ./credentials.json:/app/credentials.json:ro
       - whisper_cache:/app/cache
 
-    # run only AFTER orchestrator completes successfully
     depends_on:
       orchestrator:
         condition: service_completed_successfully
@@ -83,8 +80,8 @@ services:
       - WORKER_LOG_GROUP=/transcription/workers
     volumes:
       - ./:/app
-    # This container does nothing until you run it manually
     entrypoint: ["bash", "-lc", "sleep infinity"]
 
 volumes:
   whisper_cache:
+  gdrive_state:
