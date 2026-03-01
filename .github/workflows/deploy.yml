@@ -1,4 +1,4 @@
-name: EC2 Deploy (Docker Compose: Orchestrator -> Pipeline)
+name: "EC2 Deploy (Docker Compose: Orchestrator -> Pipeline)"
 
 on:
   push:
@@ -25,7 +25,8 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Ensure main EC2 is running (handle stopping/pending)
+      - name: Ensure main EC2 is running
+        shell: bash
         run: |
           set -euo pipefail
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
@@ -45,9 +46,9 @@ jobs:
             echo "Instance is pending. Waiting for running..."
             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
           elif [ "$STATE" = "running" ]; then
-            echo "EC2 already running."
+            echo "Instance already running."
           elif [ "$STATE" = "stopped" ]; then
-            echo "Starting EC2..."
+            echo "Starting instance..."
             aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
           else
@@ -56,28 +57,31 @@ jobs:
           fi
 
       - name: Wait for EC2 status checks OK
+        shell: bash
         run: |
           set -euo pipefail
           aws ec2 wait instance-status-ok --instance-ids "${{ secrets.EC2_INSTANCE_ID }}"
           echo "Instance status checks OK."
 
-      - name: Get EC2 Public IP
+      - name: Get EC2 public IP
         id: ec2ip
+        shell: bash
         run: |
           set -euo pipefail
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
-          IP="$(aws ec2 describe-instances \
-            --instance-ids "$INSTANCE_ID" \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' \
-            --output text)"
+          IP="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+
           if [ "$IP" = "None" ] || [ -z "$IP" ]; then
-            echo "ERROR: No public IP."
+            echo "ERROR: No public IP on instance."
             exit 1
           fi
+
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
           echo "EC2 Public IP: $IP"
 
-      - name: Wait for SSH (port 22)
+      - name: Wait for SSH
+        shell: bash
         run: |
           set -euo pipefail
           HOST="${{ steps.ec2ip.outputs.public_ip }}"
@@ -92,7 +96,7 @@ jobs:
           echo "ERROR: SSH not reachable."
           exit 1
 
-      - name: Deploy + run Docker Compose (orchestrator -> pipeline_rest)
+      - name: Deploy + run docker compose on main EC2 (detached)
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
@@ -117,24 +121,24 @@ jobs:
             sudo systemctl enable docker || true
             sudo systemctl start docker || true
 
-            echo "== Run docker compose =="
+            echo "== Choose compose command =="
             if command -v docker-compose >/dev/null 2>&1; then
               COMPOSE="docker-compose"
             else
               COMPOSE="docker compose"
             fi
 
-            # Clean previous run
+            echo "== Compose down (clean) =="
             $COMPOSE down || true
 
-            # Build and start
+            echo "== Compose up (build, detached) =="
             $COMPOSE up -d --build
 
-            echo "== Follow orchestrator logs (workers + wait) =="
-            docker logs -f orchestrator || true
-
-            echo "== Follow pipeline_rest logs (other scripts) =="
-            docker logs -f pipeline_rest || true
-
-            echo "== Compose ps =="
+            echo "== Show running containers =="
             $COMPOSE ps || true
+
+            echo "== Follow orchestrator logs for a while (optional) =="
+            # keep logs short so GitHub action doesn't run forever
+            timeout 600 docker logs -f orchestrator || true
+
+            echo "== Done. Orchestrator continues on EC2. =="
