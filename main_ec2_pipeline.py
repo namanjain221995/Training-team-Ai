@@ -2,7 +2,6 @@ import os
 import time
 import base64
 import random
-import threading
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -15,16 +14,16 @@ from google.auth.transport.requests import Request
 load_dotenv()
 
 # -----------------------------
-# CONFIG (from .env on MAIN EC2)
+# CONFIG (from .env on MAIN EC2 / orchestrator container)
 # -----------------------------
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
-LAUNCH_TEMPLATE_ID = os.getenv("WORKER_LAUNCH_TEMPLATE_ID", "").strip()  # lt-...
-LAUNCH_TEMPLATE_VERSION = os.getenv("WORKER_LAUNCH_TEMPLATE_VERSION", "$Default")  # use default LT version
+LAUNCH_TEMPLATE_ID = os.getenv("WORKER_LAUNCH_TEMPLATE_ID", "").strip()
+LAUNCH_TEMPLATE_VERSION = os.getenv("WORKER_LAUNCH_TEMPLATE_VERSION", "$Default")
 
 ROOT_2026_FOLDER_NAME = os.getenv("ROOT_2026_FOLDER_NAME", "2026")
-SLOT_CHOICE = os.getenv("SLOT_CHOICE", "").strip()  # 1-based index
-USE_SHARED_DRIVES = os.getenv("USE_SHARED_DRIVES", "0").strip().lower() in ("1", "true", "yes", "y")
+SLOT_CHOICE = os.getenv("SLOT_CHOICE", "4").strip()  # 1-based index
+USE_SHARED_DRIVES = os.getenv("USE_SHARED_DRIVES", "").strip().lower() in ("1", "true", "yes", "y")
 
 TOKEN_FILE = Path(os.getenv("TOKEN_FILE", "token.json"))
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -45,34 +44,20 @@ FOLDER_NAMES_TO_PROCESS = [
     "12. JD Video",
 ]
 
-# Worker limits (optional)
-MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "1"))  # 0 = launch all
+# Worker limits
+MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "2"))  # 0 = launch all
 LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.25"))
-
-# Worker logs (CloudWatch)
-WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
-WORKER_LOG_SAVE_DIR = os.getenv("WORKER_LOG_SAVE_DIR", "/home/ec2-user/worker_logs")
 
 # Wait behavior
 WAIT_POLL_SECONDS = int(os.getenv("WAIT_POLL_SECONDS", "15"))
 
-# RunId tag for this run (unique)
+# Unique RunId tag for this run (helps waiting only for current run’s workers)
 RUN_ID = os.getenv("RUN_ID", "") or time.strftime("%Y%m%d_%H%M%S")
 
-# Command to run after workers done (docker compose pipeline on main)
-DOCKER_COMPOSE_CMD = os.getenv(
-    "MAIN_COMPOSE_CMD",
-    "docker compose up -d --build && docker compose logs -f pipeline_rest"
-)
-
-# Shutdown after compose completes (option 2 behavior)
-SHUTDOWN_AFTER = os.getenv("SHUTDOWN_AFTER", "1").strip().lower() in ("1", "true", "yes", "y")
-
 # -----------------------------
-# AWS clients
+# AWS client
 # -----------------------------
 ec2 = boto3.client("ec2", region_name=AWS_REGION)
-logs = boto3.client("logs", region_name=AWS_REGION)
 
 # -----------------------------
 # Drive helpers
@@ -83,12 +68,20 @@ def _list_kwargs():
     return {}
 
 def build_drive():
+    """
+    Non-interactive Drive auth on main EC2:
+    - token.json must exist and contain refresh_token, client_id, client_secret.
+    """
     if not TOKEN_FILE.exists():
-        raise RuntimeError(f"token.json not found at {TOKEN_FILE}. Main EC2 must have a valid token.json.")
+        raise RuntimeError(f"token.json not found at {TOKEN_FILE}. Mount it into orchestrator container.")
+
     creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+
+    # refresh token if needed
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
         TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+
     return build("drive", "v3", credentials=creds)
 
 def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None):
@@ -96,6 +89,7 @@ def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None):
     if mime_type:
         q_parts.append(f"mimeType='{mime_type}'")
     q = " and ".join(q_parts)
+
     token = None
     while True:
         res = drive.files().list(
@@ -118,7 +112,7 @@ def drive_find_child(drive, parent_id: str, name: str, mime_type: Optional[str] 
 
 def drive_search_folder_anywhere(drive, folder_name: str) -> List[dict]:
     q = f"name='{folder_name}' and mimeType='{FOLDER_MIME}' and trashed=false"
-    out = []
+    out: List[dict] = []
     token = None
     while True:
         res = drive.files().list(
@@ -136,7 +130,13 @@ def drive_search_folder_anywhere(drive, folder_name: str) -> List[dict]:
 
 def is_video(name: str) -> bool:
     p = Path(name)
-    return (not p.name.startswith(".")) and (p.suffix.lower() in VIDEO_EXTS) and ("__EYE_" not in p.name)
+    if p.name.startswith("."):
+        return False
+    if p.suffix.lower() not in VIDEO_EXTS:
+        return False
+    if "__EYE_" in p.name:
+        return False
+    return True
 
 def transcript_name(video_name: str) -> str:
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
@@ -145,24 +145,27 @@ def pick_slot(drive, root_id: str) -> dict:
     slots = sorted(list(drive_list_children(drive, root_id, FOLDER_MIME)), key=lambda x: x["name"].lower())
     if not slots:
         raise RuntimeError("No slot folders found under 2026.")
+
     if SLOT_CHOICE.isdigit():
         idx = int(SLOT_CHOICE)
         if not (1 <= idx <= len(slots)):
             raise RuntimeError(f"SLOT_CHOICE out of range (1..{len(slots)})")
         return slots[idx - 1]
+
     return slots[0]
 
 def find_tasks(drive) -> List[Dict]:
     roots = drive_search_folder_anywhere(drive, ROOT_2026_FOLDER_NAME)
     if not roots:
         raise RuntimeError(f"Drive folder '{ROOT_2026_FOLDER_NAME}' not found.")
+
     roots.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
     root_id = roots[0]["id"]
 
     slot = pick_slot(drive, root_id)
     people = sorted(list(drive_list_children(drive, slot["id"], FOLDER_MIME)), key=lambda x: x["name"])
 
-    tasks = []
+    tasks: List[Dict] = []
     for person in people:
         for folder_name in FOLDER_NAMES_TO_PROCESS:
             folder = drive_find_child(drive, person["id"], folder_name, FOLDER_MIME)
@@ -177,6 +180,7 @@ def find_tasks(drive) -> List[Dict]:
                 out = transcript_name(vid["name"])
                 if drive_find_child(drive, folder_id, out, None):
                     continue
+
                 tasks.append({
                     "video_file_id": vid["id"],
                     "target_folder_id": folder_id,
@@ -185,20 +189,19 @@ def find_tasks(drive) -> List[Dict]:
                     "person": person["name"],
                     "folder": folder_name,
                 })
+
     return tasks
 
 # -----------------------------
 # Launch workers (per video)
-# NOTE: Your Launch Template user-data must already stream logs to CloudWatch
-# and read SSM token/credentials for Drive.
-# We override UserData only to inject VIDEO_FILE_ID and TARGET_FOLDER_ID.
+# Worker Launch Template contains the real logic (docker build/pull + run test2 + terminate).
+# We override only to inject VIDEO_FILE_ID/TARGET_FOLDER_ID/VIDEO_NAME.
 # -----------------------------
 USERDATA_INJECT_ONLY = """#!/bin/bash
 set -euo pipefail
 export VIDEO_FILE_ID="{VIDEO_FILE_ID}"
 export TARGET_FOLDER_ID="{TARGET_FOLDER_ID}"
 export VIDEO_NAME="{VIDEO_NAME}"
-# The rest is handled by Launch Template UserData.
 """
 
 def launch_one_worker(task: Dict) -> str:
@@ -247,78 +250,15 @@ def list_active_workers() -> List[str]:
             {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "shutting-down"]},
         ]
     )
-    ids = []
+    ids: List[str] = []
     for r in resp.get("Reservations", []):
         for i in r.get("Instances", []):
             ids.append(i["InstanceId"])
     return ids
 
-# -----------------------------
-# Log tailing (CloudWatch) for many workers
-# Each worker stream name = instance-id
-# -----------------------------
-def tail_worker_stream(instance_id: str):
-    os.makedirs(WORKER_LOG_SAVE_DIR, exist_ok=True)
-    save_path = os.path.join(WORKER_LOG_SAVE_DIR, f"{RUN_ID}_{instance_id}.log")
-
-    next_token = None
-    seen = set()
-
-    while True:
-        # stop tail if worker is no longer active and we have read logs for some time
-        try:
-            kwargs = {"logGroupName": WORKER_LOG_GROUP, "logStreamName": instance_id, "startFromHead": True}
-            if next_token:
-                kwargs["nextToken"] = next_token
-            resp = logs.get_log_events(**kwargs)
-        except logs.exceptions.ResourceNotFoundException:
-            time.sleep(2)
-            continue
-
-        next_token = resp.get("nextForwardToken")
-
-        new_lines = []
-        for e in resp.get("events", []):
-            key = (e["timestamp"], e["message"])
-            if key in seen:
-                continue
-            seen.add(key)
-            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e["timestamp"] / 1000))
-            line = f"{ts} | {instance_id} | {e['message'].rstrip()}"
-            new_lines.append(line)
-
-        if new_lines:
-            with open(save_path, "a", encoding="utf-8") as f:
-                for line in new_lines:
-                    print(line)
-                    f.write(line + "\n")
-
-        time.sleep(2)
-
-def start_log_tails(worker_ids: List[str]) -> List[threading.Thread]:
-    threads = []
-    for iid in worker_ids:
-        t = threading.Thread(target=tail_worker_stream, args=(iid,), daemon=True)
-        t.start()
-        threads.append(t)
-    return threads
-
-# -----------------------------
-# Main sequence
-# -----------------------------
-def run_main_compose():
-    print(f"[MAIN] Running compose: {DOCKER_COMPOSE_CMD}")
-    rc = os.system(DOCKER_COMPOSE_CMD)
-    print(f"[MAIN] Compose command exit code: {rc}")
-    return rc
-
-def shutdown_main():
-    print("[MAIN] Shutting down main instance now...")
-    os.system("sudo shutdown -h now")
-
 def main():
     if not LAUNCH_TEMPLATE_ID:
-        raise RuntimeError("WORKER_LAUNCH_TEMPLATE_ID not set in main .env")
+        raise RuntimeError("WORKER_LAUNCH_TEMPLATE_ID not set in .env (orchestrator container).")
 
     print(f"[RUN] RUN_ID={RUN_ID} SLOT_CHOICE={SLOT_CHOICE or '1(default)'}")
 
@@ -331,22 +271,13 @@ def main():
         print(f"[INFO] MAX_LAUNCH applied -> launching {len(tasks)} workers")
 
     if not tasks:
-        print("[INFO] No workers needed. Starting main compose directly.")
-        run_main_compose()
-        if SHUTDOWN_AFTER:
-            shutdown_main()
+        print("[DONE] No pending transcripts. Exiting ✅")
         return
-
-    worker_ids: List[str] = []
 
     for idx, task in enumerate(tasks, start=1):
         iid = launch_one_worker(task)
-        worker_ids.append(iid)
         print(f"[LAUNCH] {idx}/{len(tasks)} -> {iid} | {task['person']} | {task['folder']} | {task['video_name']}")
         time.sleep(LAUNCH_SLEEP_SECONDS)
-
-    print(f"[LOG] Starting real-time log tailing for {len(worker_ids)} workers...")
-    start_log_tails(worker_ids)
 
     print("[WAIT] Waiting for workers to finish...")
     while True:
@@ -356,12 +287,7 @@ def main():
             break
         time.sleep(WAIT_POLL_SECONDS)
 
-    print("[DONE] All workers completed ✅")
-    print("[MAIN] Starting docker compose pipeline now...")
-    run_main_compose()
-
-    if SHUTDOWN_AFTER:
-        shutdown_main()
+    print("[DONE] All workers completed ✅ (orchestrator exiting)")
 
 if __name__ == "__main__":
     main()

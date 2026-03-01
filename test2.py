@@ -48,7 +48,7 @@ OVERLAP_SECONDS = int((os.getenv("OVERLAP_SECONDS") or "2").strip())
 FORCE_RETRANSCRIBE = (os.getenv("FORCE_RETRANSCRIBE") or "").strip().lower() in ("1", "true", "yes", "y")
 
 # IMPORTANT: default to small for t2.micro safety (can override via env)
-WHISPER_MODEL = (os.getenv("WHISPER_MODEL") or "small").strip()
+WHISPER_MODEL = (os.getenv("WHISPER_MODEL") or "medium").strip()
 DEVICE = (os.getenv("DEVICE") or "cpu").strip()
 COMPUTE_TYPE = (os.getenv("COMPUTE_TYPE") or ("float16" if DEVICE == "cuda" else "int8")).strip()
 LANGUAGE = (os.getenv("LANGUAGE") or "en").strip()
@@ -57,7 +57,7 @@ USE_VAD = (os.getenv("USE_VAD") or "true").strip().lower() in ("1", "true", "yes
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
-SLOT_CHOICE_ENV = (os.getenv("SLOT_CHOICE") or "").strip()
+SLOT_CHOICE_ENV = (os.getenv("SLOT_CHOICE") or "4").strip()
 
 HEADLESS_AUTH = (os.getenv("HEADLESS_AUTH") or "").strip().lower() in ("1", "true", "yes", "y")
 CREDENTIALS_FILE = Path(os.getenv("CREDENTIALS_FILE") or "credentials.json")

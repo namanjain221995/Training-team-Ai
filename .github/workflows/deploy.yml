@@ -1,4 +1,4 @@
-name: EC2 Deploy (Main EC2 Orchestrates Workers + Compose)
+name: EC2 Deploy (Docker Compose: Orchestrator -> Pipeline)
 
 on:
   push:
@@ -92,7 +92,7 @@ jobs:
           echo "ERROR: SSH not reachable."
           exit 1
 
-      - name: Deploy + run detached (main EC2 orchestrates workers + compose)
+      - name: Deploy + run Docker Compose (orchestrator -> pipeline_rest)
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
@@ -117,8 +117,24 @@ jobs:
             sudo systemctl enable docker || true
             sudo systemctl start docker || true
 
-            echo "== Ensure run_detached.sh executable =="
-            chmod +x run_detached.sh
+            echo "== Run docker compose =="
+            if command -v docker-compose >/dev/null 2>&1; then
+              COMPOSE="docker-compose"
+            else
+              COMPOSE="docker compose"
+            fi
 
-            echo "== Start pipeline detached =="
-            ./run_detached.sh
+            # Clean previous run
+            $COMPOSE down || true
+
+            # Build and start
+            $COMPOSE up -d --build
+
+            echo "== Follow orchestrator logs (workers + wait) =="
+            docker logs -f orchestrator || true
+
+            echo "== Follow pipeline_rest logs (other scripts) =="
+            docker logs -f pipeline_rest || true
+
+            echo "== Compose ps =="
+            $COMPOSE ps || true

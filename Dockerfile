@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# System deps for insightface + opencv/mediapipe + ffmpeg + faster-whisper runtime
+# System deps for ffmpeg + opencv runtime deps + faster-whisper runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     ca-certificates \
@@ -22,7 +22,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
  && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps (make sure requirements.txt includes faster-whisper)
 COPY requirements.txt .
 RUN python -m pip install --upgrade pip setuptools wheel
 RUN pip install --no-cache-dir -r requirements.txt
@@ -30,7 +29,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy code
 COPY . .
 
-# Default shell (compose will override command)
-COPY credentials.json /app/credentials.json
-COPY token.json /app/token.json
+# Do NOT bake token/credentials into image.
+# They will be mounted via docker-compose at runtime.
 CMD ["bash"]

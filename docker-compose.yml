@@ -1,54 +1,90 @@
+version: "3.8"
+
 services:
-  spawner:
+  orchestrator:
     build:
       context: .
       dockerfile: Dockerfile
     image: test_runner-image:latest
-    pull_policy: never
-    container_name: test2_spawner
+    container_name: orchestrator
     env_file: [.env]
     environment:
-      - HEADLESS_AUTH=1
-      - CREDENTIALS_FILE=/app/credentials.json
-      - HF_TOKEN=${HF_TOKEN}
-      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - AWS_EC2_METADATA_DISABLED=false
+
+      - WORKER_LAUNCH_TEMPLATE_ID=${WORKER_LAUNCH_TEMPLATE_ID}
+      - WORKER_LAUNCH_TEMPLATE_VERSION=${WORKER_LAUNCH_TEMPLATE_VERSION:-$Default}
+      - WORKER_LOG_GROUP=/transcription/workers
+
+      - SLOT_CHOICE=${SLOT_CHOICE}
+      - ROOT_2026_FOLDER_NAME=${ROOT_2026_FOLDER_NAME:-2026}
+      - USE_SHARED_DRIVES=${USE_SHARED_DRIVES:-0}
+
       - TOKEN_FILE=/app/token.json
-      - XDG_CACHE_HOME=/app/cache
+      - CREDENTIALS_FILE=/app/credentials.json
+      - HEADLESS_AUTH=1
 
-      - TEST2_IMAGE=test_runner-image:latest
-      - MAX_PARALLEL_TEST2=8
-      - POLL_SECONDS=3
-      - CACHE_VOL=whisper_cache
-
-      - DEVICE=cpu
-      - COMPUTE_TYPE=int8
-      - WHISPER_MODEL=medium
-      - USE_VAD=true
+      - SHUTDOWN_AFTER=${SHUTDOWN_AFTER:-1}
 
     volumes:
-      - whisper_cache:/app/cache
-      - /var/run/docker.sock:/var/run/docker.sock
-    command: ["python", "spawn_test2_containers.py"]
+      - ./:/app
+      - ./token.json:/app/token.json:ro
+      - ./credentials.json:/app/credentials.json:ro
+
+    command: ["python", "main_ec2_pipeline.py"]
 
   pipeline_rest:
     image: test_runner-image:latest
-    pull_policy: never
     container_name: pipeline_rest
     env_file: [.env]
     environment:
-      - HEADLESS_AUTH=1
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - AWS_EC2_METADATA_DISABLED=false
+
+      - TOKEN_FILE=/app/token.json
       - CREDENTIALS_FILE=/app/credentials.json
+      - HEADLESS_AUTH=1
+      - XDG_CACHE_HOME=/app/cache
+
       - HF_TOKEN=${HF_TOKEN}
       - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}
-      - TOKEN_FILE=/app/token.json
-      - XDG_CACHE_HOME=/app/cache
+
     volumes:
+      - ./:/app
+      - ./token.json:/app/token.json:ro
+      - ./credentials.json:/app/credentials.json:ro
       - whisper_cache:/app/cache
-    command: >
-      sh -c "set -e; python script.py && python test3.py && python llm.py && python each-personscore-docs.py && python docs.py && python sheet.py"
+
+    # run only AFTER orchestrator completes successfully
     depends_on:
-      spawner:
+      orchestrator:
         condition: service_completed_successfully
+
+    command: >
+      sh -c "set -e;
+        python script.py &&
+        python test3.py &&
+        python llm.py &&
+        python each-personscore-docs.py &&
+        python docs.py &&
+        python sheet.py
+      "
+
+  log_viewer:
+    image: test_runner-image:latest
+    container_name: worker_log_viewer
+    env_file: [.env]
+    environment:
+      - AWS_REGION=${AWS_REGION}
+      - AWS_DEFAULT_REGION=${AWS_REGION}
+      - AWS_EC2_METADATA_DISABLED=false
+      - WORKER_LOG_GROUP=/transcription/workers
+    volumes:
+      - ./:/app
+    # This container does nothing until you run it manually
+    entrypoint: ["bash", "-lc", "sleep infinity"]
 
 volumes:
   whisper_cache:
