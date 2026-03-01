@@ -34,7 +34,15 @@ GDOC_MIME = "application/vnd.google-apps.document"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 FOLDER_NAMES_TO_PROCESS = [
-    
+    "3. Introduction Video",
+    "4. Mock Interview (First Call)",
+    "5. Project Scenarios",
+    "6. 30 Questions Related to Their Niche",
+    "7. 50 Questions Related to the Resume",
+    "8. Tools & Technology Videos",
+    "9. System Design Video (with Draw.io)",
+    "10. Persona Video",
+    "11. Small Talk",
     "12. JD Video",
 ]
 

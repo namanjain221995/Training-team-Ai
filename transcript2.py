@@ -8,10 +8,8 @@ import subprocess
 import contextlib
 import wave
 import re
-import threading
 from pathlib import Path
-from typing import Optional, List, Dict, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, List
 
 import requests
 from dotenv import load_dotenv
@@ -31,7 +29,7 @@ load_dotenv()
 # =========================
 # CONFIG
 # =========================
-ROOT_2026_FOLDER_NAME = "2026"
+ROOT_2026_FOLDER_NAME = "2026"  # the folder containing Slot folders (can be nested anywhere in My Drive)
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 
@@ -51,14 +49,15 @@ FOLDER_NAMES_TO_PROCESS = [
 # OpenAI Transcription
 MODEL = "gpt-4o-transcribe-diarize"
 LANGUAGE = "en"  # set None for auto-detect
-FORCE_RETRANSCRIBE = (os.getenv("FORCE_RETRANSCRIBE") or "").strip().lower() in ("1", "true", "yes", "y")
-INCLUDE_SPEAKER = (os.getenv("INCLUDE_SPEAKER") or "").strip().lower() in ("1", "true", "yes", "y")
+FORCE_RETRANSCRIBE = False
+INCLUDE_SPEAKER = False  # True => "m:ss: Speaker X: text"
 CHUNKING_STRATEGY = "auto"
-CHUNK_SECONDS = int((os.getenv("CHUNK_SECONDS") or "540").strip())  # 9 minutes default
-OVERLAP_SECONDS = int((os.getenv("OVERLAP_SECONDS") or "2").strip())
+CHUNK_SECONDS = 540  # 9 minutes
+OVERLAP_SECONDS = 2
 API_URL = "https://api.openai.com/v1/audio/transcriptions"
 
 # Transcript output naming
+# Video: Foo.mp4  -> Foo_transcripts.txt
 TRANSCRIPT_SUFFIX = "_transcripts.txt"
 
 # Google Drive OAuth
@@ -69,17 +68,6 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
 SLOT_CHOICE_ENV = (os.getenv("SLOT_CHOICE") or "").strip()
-
-# PARALLELISM
-MAX_WORKERS = int((os.getenv("MAX_WORKERS") or "350").strip())
-DRIVE_CONCURRENCY = int((os.getenv("DRIVE_CONCURRENCY") or "10").strip())
-OPENAI_CONCURRENCY = int((os.getenv("OPENAI_CONCURRENCY") or "6").strip())
-
-drive_sem = threading.Semaphore(DRIVE_CONCURRENCY)
-openai_sem = threading.Semaphore(OPENAI_CONCURRENCY)
-
-# Thread-local Drive service (safer than sharing one across threads)
-thread_local = threading.local()
 
 # =========================
 # AUTH: OpenAI
@@ -156,11 +144,6 @@ def get_drive_service():
 
     return build("drive", "v3", credentials=creds)
 
-def get_drive_service_threadlocal():
-    if not hasattr(thread_local, "service"):
-        thread_local.service = get_drive_service()
-    return thread_local.service
-
 def _list_kwargs():
     if USE_SHARED_DRIVES:
         return {"supportsAllDrives": True, "includeItemsFromAllDrives": True, "corpora": "allDrives"}
@@ -175,6 +158,13 @@ def _get_media_kwargs():
 # Drive helpers
 # =========================
 def _escape_drive_q_value(s: str) -> str:
+    """
+    Escape a value embedded inside Drive API 'q' string single quotes.
+
+    Drive query string literals are wrapped with single quotes. A single quote inside
+    must be backslash-escaped: \'
+    Also escape backslashes for safety.
+    """
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
 def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None):
@@ -201,6 +191,11 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
             break
 
 def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None):
+    """
+    Robust lookup by name that avoids Drive q-escaping pitfalls:
+    - lists children (optionally filtered by mimeType)
+    - matches the exact name in Python
+    """
     for f in drive_list_children(service, parent_id, mime_type):
         if f.get("name") == name:
             return f
@@ -223,32 +218,21 @@ def drive_download_file(service, file_id: str, dest_path: Path):
                     continue
                 raise
             if status:
-                # comment this out if too noisy
-                # print(f"      [DL  ] {int(status.progress() * 100)}%")
-                pass
+                print(f"      [DL  ] {int(status.progress() * 100)}%")
 
-def drive_upload_text(service, parent_id: str, filename: str, local_path: Path, existing_file_id: Optional[str] = None) -> str:
+def drive_upload_text(service, parent_id: str, filename: str, local_path: Path):
+    existing = drive_find_child(service, parent_id, filename, None)
     media = MediaFileUpload(str(local_path), mimetype="text/plain", resumable=True)
 
-    if existing_file_id:
-        execute_with_retries(
-            service.files().update(fileId=existing_file_id, media_body=media, **_list_kwargs())
-        )
-        return existing_file_id
-
-    # fallback: search by name
-    existing = drive_find_child(service, parent_id, filename, None)
     if existing:
         execute_with_retries(
             service.files().update(fileId=existing["id"], media_body=media, **_list_kwargs())
         )
-        return existing["id"]
-
-    meta = {"name": filename, "parents": [parent_id]}
-    created = execute_with_retries(
-        service.files().create(body=meta, media_body=media, fields="id", **_list_kwargs())
-    )
-    return created["id"]
+    else:
+        meta = {"name": filename, "parents": [parent_id]}
+        execute_with_retries(
+            service.files().create(body=meta, media_body=media, fields="id", **_list_kwargs())
+        )
 
 def debug_list_root_folders(service, limit=200):
     res = execute_with_retries(
@@ -265,6 +249,9 @@ def debug_list_root_folders(service, limit=200):
         print(" -", f["name"])
 
 def drive_search_folder_anywhere_in_my_drive(service, folder_name: str) -> List[dict]:
+    """
+    Search ALL folders matching name. Paginated. Returns list of folder dicts.
+    """
     safe_name = _escape_drive_q_value(folder_name)
     q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed=false"
 
@@ -331,18 +318,22 @@ def choose_slot(service, slots_parent_id: str) -> dict:
 # =========================
 def is_video_name(name: str) -> bool:
     p = Path(name)
+
     if p.name.startswith("."):
         return False
+
     if p.suffix.lower() not in VIDEO_EXTS:
         return False
+
+    # Skip eye-tracker generated/processed videos
     if "__EYE_" in p.name:
         return False
+
     return True
 
 def extract_audio_wav(video_path: Path, wav_path: Path):
     proc = subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path),
-         "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", str(wav_path)],
+        ["ffmpeg", "-y", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", str(wav_path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -365,8 +356,7 @@ def split_audio(wav_path: Path, chunk_seconds: int, overlap_seconds: int):
         out = wav_path.with_name(f"{wav_path.stem}_part{idx}.wav")
 
         proc = subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(wav_path),
-             "-ss", str(ss), "-t", str(duration), "-reset_timestamps", "1", str(out)],
+            ["ffmpeg", "-y", "-i", str(wav_path), "-ss", str(ss), "-t", str(duration), str(out)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -442,92 +432,6 @@ def transcribe_diarize_with_http(wav_path: Path, max_retries: int = 6) -> dict:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
 
 # =========================
-# TASK PROCESSING (parallel worker)
-# =========================
-def process_one_video(task: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    One task = one video -> transcript upload
-    """
-    service = get_drive_service_threadlocal()
-
-    vid = task["vid"]
-    out_folder_id = task["out_folder_id"]
-    out_txt_name = task["out_txt_name"]
-    existing_out_id = task.get("existing_out_id")
-
-    slot_name = task["slot_name"]
-    person_name = task["person_name"]
-    folder_name = task["folder_name"]
-
-    # Double-check skip (if another worker already produced it)
-    if existing_out_id and not FORCE_RETRANSCRIBE:
-        return {"status": "skipped", "video": vid["name"], "where": f"{slot_name}/{person_name}/{folder_name}"}
-
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-
-        safe_vid_name = safe_local_filename(vid["name"], "video.mp4")
-        safe_txt_name = safe_local_filename(out_txt_name, out_txt_name)
-
-        local_video = td / safe_vid_name
-        local_wav = td / f"{Path(safe_vid_name).stem}__tmp.wav"
-        local_txt = td / safe_txt_name
-
-        # Download video (Drive throttled)
-        with drive_sem:
-            drive_download_file(service, vid["id"], local_video)
-
-        # Extract + split
-        extract_audio_wav(local_video, local_wav)
-        parts = split_audio(local_wav, CHUNK_SECONDS, OVERLAP_SECONDS)
-
-        merged = []
-        for i, (chunk_path, actual_ss, logical_start) in enumerate(parts):
-            try:
-                # OpenAI throttled
-                with openai_sem:
-                    resp = transcribe_diarize_with_http(chunk_path)
-
-                lines = to_timestamp_lines(pick_chunks(resp), include_speaker=INCLUDE_SPEAKER)
-
-                for rel_start, line in lines:
-                    abs_start = rel_start + actual_ss
-                    # Drop overlap lines that belong to the previous chunk
-                    if i > 0 and abs_start < logical_start:
-                        continue
-                    merged.append(
-                        (
-                            abs_start,
-                            line.replace(f"{fmt_ts(rel_start)}:", f"{fmt_ts(abs_start)}:", 1),
-                        )
-                    )
-            finally:
-                chunk_path.unlink(missing_ok=True)
-
-        merged.sort(key=lambda x: x[0])
-
-        # Light dedupe (0.5s buckets) - keep as your original
-        final_lines = []
-        seen = set()
-        for abs_start, line in merged:
-            bucket = int(abs_start * 2)  # 0.5-second buckets
-            tail = line.split(":", 1)[-1].strip().lower()
-            key = (bucket, tail)
-            if key in seen:
-                continue
-            seen.add(key)
-            final_lines.append(line)
-
-        local_txt.write_text("\n".join(final_lines).strip() + "\n", encoding="utf-8")
-
-        # Upload transcript (Drive throttled)
-        with drive_sem:
-            out_id = drive_upload_text(service, out_folder_id, out_txt_name, local_txt, existing_file_id=existing_out_id)
-
-    return {"status": "ok", "video": vid["name"], "out": out_txt_name, "out_id": out_id,
-            "where": f"{slot_name}/{person_name}/{folder_name}"}
-
-# =========================
 # MAIN
 # =========================
 def main():
@@ -542,10 +446,6 @@ def main():
     except Exception:
         raise RuntimeError("ffmpeg not found in PATH. Install ffmpeg and restart terminal.")
 
-    print(f"[INFO] MAX_WORKERS={MAX_WORKERS} DRIVE_CONCURRENCY={DRIVE_CONCURRENCY} OPENAI_CONCURRENCY={OPENAI_CONCURRENCY}")
-    print(f"[INFO] FORCE_RETRANSCRIBE={FORCE_RETRANSCRIBE} INCLUDE_SPEAKER={INCLUDE_SPEAKER} CHUNK_SECONDS={CHUNK_SECONDS}")
-
-    # Use one service for scanning/building tasks (single-thread)
     service = get_drive_service()
 
     # Find your "2026" folder ANYWHERE
@@ -567,91 +467,120 @@ def main():
         print("[WARN] Using the most recently modified one.\n")
 
     root_2026_id = candidates[0]["id"]
+    slots_parent_id = root_2026_id
 
     # Pick slot (auto via SLOT_CHOICE or interactive)
-    slot = choose_slot(service, root_2026_id)
+    slot = choose_slot(service, slots_parent_id)
 
-    # Build all tasks first
-    tasks: List[Dict[str, Any]] = []
+    total = done = skipped = failed = 0
 
     people = sorted(list(drive_list_children(service, slot["id"], FOLDER_MIME)), key=lambda x: x["name"])
 
     for person in people:
-        # List person children folders once, build map
-        person_children = list(drive_list_children(service, person["id"], None))
-        folder_by_name = {f["name"]: f for f in person_children if f.get("mimeType") == FOLDER_MIME}
-
         for folder_name in FOLDER_NAMES_TO_PROCESS:
-            target = folder_by_name.get(folder_name)
+            target = drive_find_child(service, person["id"], folder_name, FOLDER_MIME)
             if not target:
                 continue
 
-            # List deliverable folder children once
-            deliver_children = list(drive_list_children(service, target["id"], None))
-            by_name = {f["name"]: f for f in deliver_children}
+            out_folder_id = target["id"]
 
+            children = list(drive_list_children(service, target["id"], None))
             videos = sorted(
-                [f for f in deliver_children if f.get("mimeType") != FOLDER_MIME and is_video_name(f["name"])],
+                [f for f in children if f.get("mimeType") != FOLDER_MIME and is_video_name(f["name"])],
                 key=lambda x: x["name"],
             )
             if not videos:
                 continue
 
-            for vid in videos:
-                out_txt_name = transcript_output_name(vid["name"])
-                existing = by_name.get(out_txt_name)
+            print("\n" + "=" * 100)
+            print("Slot  :", slot["name"])
+            print("Person:", person["name"])
+            print("Folder:", folder_name)
+            print("Videos:", len(videos))
 
-                if existing and not FORCE_RETRANSCRIBE:
-                    # skip at task-build time
+            for vid in videos:
+                total += 1
+
+                out_txt_name = transcript_output_name(vid["name"])
+
+                existing_out = drive_find_child(service, out_folder_id, out_txt_name, None)
+                if existing_out and not FORCE_RETRANSCRIBE:
+                    skipped += 1
+                    print(f"  [SKIP] {vid['name']} -> {out_txt_name} exists")
                     continue
 
-                tasks.append({
-                    "slot_name": slot["name"],
-                    "person_name": person["name"],
-                    "folder_name": folder_name,
-                    "out_folder_id": target["id"],
-                    "vid": {"id": vid["id"], "name": vid["name"]},
-                    "out_txt_name": out_txt_name,
-                    "existing_out_id": existing["id"] if existing else None,
-                })
+                try:
+                    with tempfile.TemporaryDirectory() as td:
+                        td = Path(td)
 
-    if not tasks:
-        print("[INFO] No videos to process (everything already transcribed or no videos found).")
-        return
+                        safe_vid_name = safe_local_filename(vid["name"], "video.mp4")
+                        safe_txt_name = safe_local_filename(out_txt_name, out_txt_name)
 
-    print(f"[INFO] Tasks to process: {len(tasks)} (one task = one video)")
+                        local_video = td / safe_vid_name
+                        local_wav = td / f"{Path(safe_vid_name).stem}__tmp.wav"
+                        local_txt = td / safe_txt_name
 
-    # Run parallel workers
-    total = len(tasks)
-    done = skipped = failed = 0
+                        print(f"  [DL  ] {vid['name']} -> downloading")
+                        drive_download_file(service, vid["id"], local_video)
 
-    lock = threading.Lock()
+                        print("  [RUN ] extracting audio")
+                        extract_audio_wav(local_video, local_wav)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(process_one_video, t) for t in tasks]
+                        dur = wav_duration_seconds(local_wav)
+                        print(f"  [INFO] Audio duration: {dur/60:.1f} min")
 
-        for fut in as_completed(futures):
-            try:
-                res = fut.result()
-                with lock:
-                    if res["status"] == "ok":
+                        parts = split_audio(local_wav, CHUNK_SECONDS, OVERLAP_SECONDS)
+
+                        merged = []
+                        for i, (chunk_path, actual_ss, logical_start) in enumerate(parts):
+                            try:
+                                print(f"    [CHUNK] part{i} ss={actual_ss:.1f}s (logical={logical_start:.1f}s)")
+                                resp = transcribe_diarize_with_http(chunk_path)
+                                lines = to_timestamp_lines(pick_chunks(resp), include_speaker=INCLUDE_SPEAKER)
+
+                                for rel_start, line in lines:
+                                    abs_start = rel_start + actual_ss
+                                    # Drop overlap lines that belong to the previous chunk
+                                    if i > 0 and abs_start < logical_start:
+                                        continue
+                                    merged.append(
+                                        (
+                                            abs_start,
+                                            line.replace(f"{fmt_ts(rel_start)}:", f"{fmt_ts(abs_start)}:", 1),
+                                        )
+                                    )
+                            finally:
+                                chunk_path.unlink(missing_ok=True)
+
+                        merged.sort(key=lambda x: x[0])
+
+                        # Light dedupe (0.5s buckets)
+                        final_lines = []
+                        seen = set()
+                        for abs_start, line in merged:
+                            bucket = int(abs_start * 2)  # 0.5-second buckets
+                            tail = line.split(":", 1)[-1].strip().lower()
+                            key = (bucket, tail)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            final_lines.append(line)
+
+                        local_txt.write_text("\n".join(final_lines).strip() + "\n", encoding="utf-8")
+
+                        print(f"  [UP  ] uploading -> {slot['name']}/{person['name']}/{folder_name}/{out_txt_name}")
+                        drive_upload_text(service, out_folder_id, out_txt_name, local_txt)
+
                         done += 1
-                        print(f"[OK  ] {res['where']} :: {res['video']} -> {res['out']}")
-                    else:
-                        skipped += 1
-                        print(f"[SKIP] {res['where']} :: {res['video']}")
-            except Exception as e:
-                with lock:
+                        print("  [OK  ] done")
+
+                except Exception as e:
                     failed += 1
-                    print(f"[FAIL] {type(e).__name__}: {e}")
+                    print(f"  [FAIL] {vid['name']} -> {type(e).__name__}: {e}")
 
     print("\nSUMMARY")
-    print("Total tasks :", total)
-    print("Done        :", done)
-    print("Skipped     :", skipped)
-    print("Failed      :", failed)
-    print("Output root :", ROOT_2026_FOLDER_NAME)
-    print("Slot        :", slot["name"])
+    print("Total:", total, "Done:", done, "Skipped:", skipped, "Failed:", failed)
+    print("Output root folder:", ROOT_2026_FOLDER_NAME)
 
 if __name__ == "__main__":
     main()

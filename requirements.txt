@@ -12,3 +12,6 @@ openpyxl==3.1.5
 onnxruntime==1.20.1
 insightface==0.7.3
 tqdm==4.67.1
+faster-whisper
+redis
+docker

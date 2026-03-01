@@ -31,7 +31,7 @@ if not OPENAI_API_KEY:
 SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()
 
 # Optional model override
-MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5").strip()
+MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-nano").strip()
 
 # Shared drives flag from env (optional)
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
@@ -85,6 +85,7 @@ PROMPT_NEEDS_CV = {
     "persona.txt",
     "JD-prompt.txt",
     "System-design.txt",
+    "smalltalk.txt",
 }
 
 # Prompts that require diagram images from SAME deliverable folder
@@ -92,7 +93,6 @@ PROMPT_NEEDS_CV = {
 PROMPT_NEEDS_PNG = {
     "Tools-Technology-prompt.txt",
     "System-design.txt",
-    "JD-prompt.txt",
 }
 
 # ============================================================

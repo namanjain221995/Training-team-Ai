@@ -618,7 +618,6 @@ def apply_hysteresis(current_label: str, proposed_label: str, hold_state: Dict[s
 
     return current_label
 
-
 # =========================
 # Candidate matching (InsightFace)
 # =========================

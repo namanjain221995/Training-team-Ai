@@ -1,25 +1,54 @@
-version: "3.8"
-
 services:
-  test_runner:
+  spawner:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: test_runner
-    env_file:
-      - .env
+    image: test_runner-image:latest
+    pull_policy: never
+    container_name: test2_spawner
+    env_file: [.env]
     environment:
-      - PYTHONUNBUFFERED=1
-    volumes:
-      - .:/app
-      - /app/.venv
-    command: >
-      sh -c "
-        pip install --no-cache-dir -r requirements.txt && python script.py && python llm.py && python each-personscore-docs.py && python docs.py && python sheet.py && python eye-tracker.py && python eye-docs.py && python eye-sheet.py && python final-mail.py   
-      "
-    networks:
-      - test_network
+      - HEADLESS_AUTH=1
+      - CREDENTIALS_FILE=/app/credentials.json
+      - HF_TOKEN=${HF_TOKEN}
+      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}
+      - TOKEN_FILE=/app/token.json
+      - XDG_CACHE_HOME=/app/cache
 
-networks:
-  test_network:
-    driver: bridge
+      - TEST2_IMAGE=test_runner-image:latest
+      - MAX_PARALLEL_TEST2=8
+      - POLL_SECONDS=3
+      - CACHE_VOL=whisper_cache
+
+      - DEVICE=cpu
+      - COMPUTE_TYPE=int8
+      - WHISPER_MODEL=medium
+      - USE_VAD=true
+
+    volumes:
+      - whisper_cache:/app/cache
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["python", "spawn_test2_containers.py"]
+
+  pipeline_rest:
+    image: test_runner-image:latest
+    pull_policy: never
+    container_name: pipeline_rest
+    env_file: [.env]
+    environment:
+      - HEADLESS_AUTH=1
+      - CREDENTIALS_FILE=/app/credentials.json
+      - HF_TOKEN=${HF_TOKEN}
+      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN}
+      - TOKEN_FILE=/app/token.json
+      - XDG_CACHE_HOME=/app/cache
+    volumes:
+      - whisper_cache:/app/cache
+    command: >
+      sh -c "set -e; python script.py && python test3.py && python llm.py && python each-personscore-docs.py && python docs.py && python sheet.py"
+    depends_on:
+      spawner:
+        condition: service_completed_successfully
+
+volumes:
+  whisper_cache:

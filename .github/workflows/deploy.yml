@@ -1,4 +1,4 @@
-name: EC2 Deploy (Detached)
+name: EC2 Deploy + Launch Workers + Run Main Pipeline
 
 on:
   push:
@@ -16,7 +16,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Configure AWS credentials (OIDC)
@@ -25,7 +25,69 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Ensure EC2 is running (handle stopping/pending)
+      # ---------------------------
+      # 1) Launch worker instances from GitHub Actions (Option 1)
+      # ---------------------------
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install controller dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 google-api-python-client google-auth google-auth-oauthlib
+
+      - name: Launch worker instances for test2.py (1 per pending video)
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          WORKER_LAUNCH_TEMPLATE_ID: ${{ secrets.WORKER_LAUNCH_TEMPLATE_ID }}
+
+          # SSM params (you already added these secrets)
+          SSM_ENV_PARAM: ${{ secrets.SSM_ENV_PARAM }}
+          SSM_TOKEN_PARAM: ${{ secrets.SSM_TOKEN_PARAM }}
+          # NOTE: your secret name is SSM_CREDENTIALIALS_PARAM (spelling)
+          SSM_CREDENTIALS_PARAM: ${{ secrets.SSM_CREDENTIALS_PARAM }}
+
+          # Optional if you use slot selection:
+          # SLOT_CHOICE: "1"
+
+          # Optional tuning:
+          # MAX_LAUNCH: "0"               # 0 = unlimited
+          # LAUNCH_SLEEP_SECONDS: "0.25"  # throttle AWS API calls a little
+        run: |
+          python controller_launch_workers.py
+
+      - name: Wait for all worker instances to finish (tag Purpose=test2)
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          set -euo pipefail
+          echo "Waiting for worker instances to finish..."
+          # Wait up to 90 minutes
+          for i in {1..540}; do
+            RUNNING_COUNT="$(aws ec2 describe-instances \
+              --filters 'Name=tag:Purpose,Values=test2' 'Name=instance-state-name,Values=pending,running,stopping,shutting-down' \
+              --query 'Reservations[].Instances[].InstanceId' --output text | wc -w | tr -d ' ')"
+
+            echo "Workers still active: ${RUNNING_COUNT}"
+            if [ "${RUNNING_COUNT}" = "0" ]; then
+              echo "All workers finished ✅"
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "ERROR: Timed out waiting for workers."
+          exit 1
+
+      # ---------------------------
+      # 2) Ensure MAIN EC2 is running and execute the rest pipeline
+      # ---------------------------
+      - name: Ensure main EC2 is running (handle stopping/pending)
         run: |
           set -euo pipefail
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
@@ -35,40 +97,31 @@ jobs:
 
           echo "Current state: $STATE"
 
-          # If it's stopping, wait for stopped first
           if [ "$STATE" = "stopping" ]; then
             echo "Instance is stopping. Waiting for it to stop..."
             aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
             STATE="stopped"
-            echo "Now state: $STATE"
           fi
 
-          # If it's pending, wait for running
           if [ "$STATE" = "pending" ]; then
             echo "Instance is pending. Waiting for running..."
             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-            echo "EC2 running."
-            exit 0
-          fi
-
-          # If it's running already, nothing to do
-          if [ "$STATE" = "running" ]; then
+          elif [ "$STATE" = "running" ]; then
             echo "EC2 already running."
-            exit 0
-          fi
-
-          # If stopped, start it
-          if [ "$STATE" = "stopped" ]; then
+          elif [ "$STATE" = "stopped" ]; then
             echo "Starting EC2..."
             aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-            echo "EC2 running."
-            exit 0
+          else
+            echo "ERROR: Instance is in unexpected state: $STATE"
+            exit 1
           fi
 
-          # Other states: shutting-down/terminated etc.
-          echo "ERROR: Instance is in unexpected state: $STATE"
-          exit 1
+      - name: Wait for EC2 status checks OK
+        run: |
+          set -euo pipefail
+          aws ec2 wait instance-status-ok --instance-ids "${{ secrets.EC2_INSTANCE_ID }}"
+          echo "Instance status checks OK."
 
       - name: Get EC2 Public IP
         id: ec2ip
@@ -101,7 +154,7 @@ jobs:
           echo "ERROR: SSH not reachable."
           exit 1
 
-      - name: Deploy + run detached (call run_detached.sh)
+      - name: Deploy + run main pipeline detached (run_detached.sh)
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
@@ -111,16 +164,16 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           port: 22
           script_stop: true
-          command_timeout: 30m
+          command_timeout: 60m
           envs: EC2_PATH
           script: |
             set -euo pipefail
-
             cd "$EC2_PATH"
 
             echo "== Update code =="
             git fetch --all
             git reset --hard origin/main
+            git clean -fd || true
 
             echo "== Ensure docker running =="
             sudo systemctl enable docker || true
