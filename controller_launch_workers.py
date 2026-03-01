@@ -43,7 +43,7 @@ LAUNCH_TEMPLATE_VERSION = os.getenv("WORKER_LAUNCH_TEMPLATE_VERSION", "$Latest")
 LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.25"))  # small delay to avoid API throttles
 
 # Optional: if you ever want to cap, set MAX_LAUNCH (blank = no cap)
-MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "3"))  # 0 = no limit
+MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "2"))  # 0 = no limit
 
 # Drive token/credentials fetched from SSM
 SSM_ENV_PARAM = os.getenv("SSM_ENV_PARAM", "/transcription/worker/env")
