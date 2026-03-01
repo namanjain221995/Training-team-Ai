@@ -1,5 +1,4 @@
 import os
-import io
 import time
 import random
 import base64
@@ -8,9 +7,7 @@ from typing import Optional, List, Dict
 
 import boto3
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 
 # ---------------------------
@@ -39,11 +36,11 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 LAUNCH_TEMPLATE_ID = os.getenv("WORKER_LAUNCH_TEMPLATE_ID", "").strip()  # lt-...
 LAUNCH_TEMPLATE_VERSION = os.getenv("WORKER_LAUNCH_TEMPLATE_VERSION", "$Latest")
 
-# You said “200 videos -> 200 instances”. This launches all, but safely throttles API calls.
-LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.25"))  # small delay to avoid API throttles
+# Throttle to avoid AWS API throttles
+LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.25"))
 
-# Optional: if you ever want to cap, set MAX_LAUNCH (blank = no cap)
-MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "1"))  # 0 = no limit
+# 0 = no limit (launch all)
+MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "1"))
 
 # Drive token/credentials fetched from SSM
 SSM_ENV_PARAM = os.getenv("SSM_ENV_PARAM", "/transcription/worker/env")
@@ -53,6 +50,9 @@ SSM_TOKEN_PARAM = os.getenv("SSM_TOKEN_PARAM", "/transcription/worker/token_json
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES", "0").strip().lower() in ("1", "true", "yes", "y"))
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# CloudWatch worker logs
+WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
 
 # ---------------------------
 # Helpers: SSM fetch
@@ -132,14 +132,12 @@ def transcript_output_name(video_name: str) -> str:
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
 
 # ---------------------------
-# Drive auth using token.json content
+# Drive auth (non-interactive)
 # ---------------------------
-def get_drive_service_from_token_json(token_json: str):
-    creds = Credentials.from_authorized_user_info(eval(token_json) if token_json.strip().startswith("{") else None)
-
 def build_drive_service(credentials_json_text: str, token_json_text: str):
     """
-    We write token/creds to disk because google libs expect file paths reliably.
+    Write creds/token to disk (Google libs work best with file paths).
+    NOTE: In GitHub Actions we NEVER do interactive auth.
     """
     work = Path(".tmp_drive_auth")
     work.mkdir(exist_ok=True)
@@ -157,45 +155,73 @@ def build_drive_service(credentials_json_text: str, token_json_text: str):
             creds.refresh(Request())
             token_path.write_text(creds.to_json(), encoding="utf-8")
         else:
-            # In GitHub Actions you should NOT do interactive auth
             raise RuntimeError("Drive token is missing/invalid. Update /transcription/worker/token_json in SSM.")
+
     return build("drive", "v3", credentials=creds)
 
 # ---------------------------
-# Worker UserData template (FULL script)
+# Worker UserData template (FULL + CloudWatch Logs)
 # We override UserData per-instance so each worker knows which video to process.
 # ---------------------------
 WORKER_USERDATA_TEMPLATE = """#!/bin/bash
 set -euo pipefail
 
+# Log everything
 exec > >(tee -a /var/log/worker-userdata.log) 2>&1
 echo "[BOOT] Worker starting..."
+date
 
 # Injected task
 export VIDEO_FILE_ID="{VIDEO_FILE_ID}"
 export TARGET_FOLDER_ID="{TARGET_FOLDER_ID}"
 export VIDEO_NAME="{VIDEO_NAME}"
 
+# deps
 dnf update -y
-dnf install -y git python3-pip ffmpeg jq
+dnf install -y git python3-pip ffmpeg jq amazon-cloudwatch-agent
 python3 -m pip install --upgrade pip
 
-mkdir -p /app
+# CloudWatch log streaming
+cat >/opt/aws/amazon-cloudwatch-agent/bin/config.json <<'EOF'
+{{
+  "logs": {{
+    "logs_collected": {{
+      "files": {{
+        "collect_list": [
+          {{
+            "file_path": "/var/log/worker-userdata.log",
+            "log_group_name": "{WORKER_LOG_GROUP}",
+            "log_stream_name": "{{instance_id}}"
+          }}
+        ]
+      }}
+    }}
+  }}
+}}
+EOF
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \\
+  -a fetch-config -m ec2 \\
+  -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
+
+mkdir -p /app /app/cache
 cd /app
 
 echo "[BOOT] Fetching config from SSM..."
-aws ssm get-parameter --name "/transcription/worker/env" --with-decryption --query "Parameter.Value" --output text > /app/.env
-aws ssm get-parameter --name "/transcription/worker/credentials_json" --with-decryption --query "Parameter.Value" --output text > /app/credentials.json
-aws ssm get-parameter --name "/transcription/worker/token_json" --with-decryption --query "Parameter.Value" --output text > /app/token.json
+aws ssm get-parameter --name "{SSM_ENV_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/.env
+aws ssm get-parameter --name "{SSM_CREDENTIALS_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/credentials.json
+aws ssm get-parameter --name "{SSM_TOKEN_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/token.json
 
 set -a
-source /app/.env
+source /app/.env || true
 set +a
 
 export CREDENTIALS_FILE=/app/credentials.json
 export TOKEN_FILE=/app/token.json
 export HEADLESS_AUTH=1
 export XDG_CACHE_HOME=/app/cache
+export HF_HOME=/app/cache
+export TRANSFORMERS_CACHE=/app/cache
 
 echo "[BOOT] Cloning repo..."
 rm -rf repo
@@ -225,8 +251,8 @@ def find_pending_tasks(drive) -> List[Dict]:
     roots.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
     root_id = roots[0]["id"]
 
-    # Slot selection: for GitHub actions, use SLOT_CHOICE env var index (1-based)
-    slot_choice = os.getenv("SLOT_CHOICE", "").strip()
+    # Slot selection: use SLOT_CHOICE env var index (1-based). Default: first slot.
+    slot_choice = os.getenv("SLOT_CHOICE", "4").strip()
     slot_folders = sorted(list(drive_list_children(drive, root_id, FOLDER_MIME)), key=lambda x: x["name"].lower())
     if not slot_folders:
         raise RuntimeError("No slot folders found under 2026.")
@@ -237,7 +263,6 @@ def find_pending_tasks(drive) -> List[Dict]:
             raise RuntimeError(f"SLOT_CHOICE out of range (1..{len(slot_folders)})")
         slot = slot_folders[idx - 1]
     else:
-        # default: first slot
         slot = slot_folders[0]
 
     people = sorted(list(drive_list_children(drive, slot["id"], FOLDER_MIME)), key=lambda x: x["name"])
@@ -255,8 +280,7 @@ def find_pending_tasks(drive) -> List[Dict]:
 
             for vid in videos:
                 out_name = transcript_output_name(vid["name"])
-                exists = drive_find_child(drive, folder_id, out_name, None)
-                if exists:
+                if drive_find_child(drive, folder_id, out_name, None):
                     continue
 
                 tasks.append({
@@ -273,15 +297,18 @@ def find_pending_tasks(drive) -> List[Dict]:
 # ---------------------------
 # EC2 Launch
 # ---------------------------
-def launch_worker(ec2, task: Dict):
+def launch_worker(ec2, task: Dict) -> str:
     userdata = WORKER_USERDATA_TEMPLATE.format(
         VIDEO_FILE_ID=task["video_file_id"],
         TARGET_FOLDER_ID=task["target_folder_id"],
         VIDEO_NAME=task["video_name"].replace('"', "'"),
+        WORKER_LOG_GROUP=WORKER_LOG_GROUP,
+        SSM_ENV_PARAM=SSM_ENV_PARAM,
+        SSM_CREDENTIALS_PARAM=SSM_CREDENTIALS_PARAM,
+        SSM_TOKEN_PARAM=SSM_TOKEN_PARAM,
     )
     userdata_b64 = base64.b64encode(userdata.encode("utf-8")).decode("utf-8")
 
-    # Retry if AWS throttles
     for attempt in range(8):
         try:
             resp = ec2.run_instances(
@@ -295,13 +322,15 @@ def launch_worker(ec2, task: Dict):
                         "Tags": [
                             {"Key": "Name", "Value": "transcription-worker"},
                             {"Key": "Purpose", "Value": "test2"},
+                            {"Key": "Slot", "Value": task["slot"][:256]},
+                            {"Key": "Person", "Value": task["person"][:256]},
+                            {"Key": "Folder", "Value": task["folder"][:256]},
                             {"Key": "VideoFileId", "Value": task["video_file_id"][:128]},
                         ],
                     }
                 ],
             )
-            instance_id = resp["Instances"][0]["InstanceId"]
-            return instance_id
+            return resp["Instances"][0]["InstanceId"]
         except Exception as e:
             msg = str(e)
             if any(x in msg for x in ["RequestLimitExceeded", "Throttling", "Rate exceeded"]):

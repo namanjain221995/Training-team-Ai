@@ -1,4 +1,4 @@
-name: EC2 Deploy + Launch Workers + Run Main Pipeline
+name: EC2 Deploy (Main EC2 Orchestrates Workers + Compose)
 
 on:
   push:
@@ -25,68 +25,6 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # ---------------------------
-      # 1) Launch worker instances from GitHub Actions (Option 1)
-      # ---------------------------
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install controller dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install boto3 google-api-python-client google-auth google-auth-oauthlib
-
-      - name: Launch worker instances for test2.py (1 per pending video)
-        env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          WORKER_LAUNCH_TEMPLATE_ID: ${{ secrets.WORKER_LAUNCH_TEMPLATE_ID }}
-
-          # SSM params (you already added these secrets)
-          SSM_ENV_PARAM: ${{ secrets.SSM_ENV_PARAM }}
-          SSM_TOKEN_PARAM: ${{ secrets.SSM_TOKEN_PARAM }}
-          # NOTE: your secret name is SSM_CREDENTIALIALS_PARAM (spelling)
-          SSM_CREDENTIALS_PARAM: ${{ secrets.SSM_CREDENTIALS_PARAM }}
-
-          # Optional if you use slot selection:
-          # SLOT_CHOICE: "1"
-
-          # Optional tuning:
-          # MAX_LAUNCH: "0"               # 0 = unlimited
-          # LAUNCH_SLEEP_SECONDS: "0.25"  # throttle AWS API calls a little
-        run: |
-          python controller_launch_workers.py
-
-      - name: Wait for all worker instances to finish (tag Purpose=test2)
-        env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-        run: |
-          set -euo pipefail
-          echo "Waiting for worker instances to finish..."
-          # Wait up to 90 minutes
-          for i in {1..540}; do
-            RUNNING_COUNT="$(aws ec2 describe-instances \
-              --filters 'Name=tag:Purpose,Values=test2' 'Name=instance-state-name,Values=pending,running,stopping,shutting-down' \
-              --query 'Reservations[].Instances[].InstanceId' --output text | wc -w | tr -d ' ')"
-
-            echo "Workers still active: ${RUNNING_COUNT}"
-            if [ "${RUNNING_COUNT}" = "0" ]; then
-              echo "All workers finished ✅"
-              exit 0
-            fi
-            sleep 10
-          done
-
-          echo "ERROR: Timed out waiting for workers."
-          exit 1
-
-      # ---------------------------
-      # 2) Ensure MAIN EC2 is running and execute the rest pipeline
-      # ---------------------------
       - name: Ensure main EC2 is running (handle stopping/pending)
         run: |
           set -euo pipefail
@@ -98,7 +36,7 @@ jobs:
           echo "Current state: $STATE"
 
           if [ "$STATE" = "stopping" ]; then
-            echo "Instance is stopping. Waiting for it to stop..."
+            echo "Instance is stopping. Waiting for stopped..."
             aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
             STATE="stopped"
           fi
@@ -113,7 +51,7 @@ jobs:
             aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
           else
-            echo "ERROR: Instance is in unexpected state: $STATE"
+            echo "ERROR: Unexpected instance state: $STATE"
             exit 1
           fi
 
@@ -154,7 +92,7 @@ jobs:
           echo "ERROR: SSH not reachable."
           exit 1
 
-      - name: Deploy + run main pipeline detached (run_detached.sh)
+      - name: Deploy + run detached (main EC2 orchestrates workers + compose)
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
