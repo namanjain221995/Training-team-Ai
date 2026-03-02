@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   orchestrator:
     build:
@@ -23,6 +21,18 @@ services:
 
       - TOKEN_FILE=/app/token.json
       - TOKEN_FILE_WRITE=/app/state/token_refreshed.json
+
+      # Optional: control Drive retries
+      - GOOGLE_EXECUTE_RETRIES=${GOOGLE_EXECUTE_RETRIES:-8}
+      - GOOGLE_PAGE_SIZE=${GOOGLE_PAGE_SIZE:-500}
+
+      # Worker termination behavior (recommended)
+      - USE_SHUTDOWN_TERMINATE=${USE_SHUTDOWN_TERMINATE:-1}
+
+      # Optional: SSM param names (worker reads)
+      - SSM_ENV_PARAM=${SSM_ENV_PARAM:-/transcription/worker/env}
+      - SSM_CREDENTIALS_PARAM=${SSM_CREDENTIALS_PARAM:-/transcription/worker/credentials_json}
+      - SSM_TOKEN_PARAM=${SSM_TOKEN_PARAM:-/transcription/worker/token_json}
 
     volumes:
       - ./:/app

@@ -56,7 +56,7 @@ WAIT_POLL_SECONDS = int(os.getenv("WAIT_POLL_SECONDS", "15"))
 # Unique RunId tag for this run
 RUN_ID = os.getenv("RUN_ID", "") or time.strftime("%Y%m%d_%H%M%S")
 
-# SSM parameters (workers read these)
+# Worker reads these from SSM (parameter names)
 SSM_ENV_PARAM = os.getenv("SSM_ENV_PARAM", "/transcription/worker/env")
 SSM_CREDENTIALS_PARAM = os.getenv("SSM_CREDENTIALS_PARAM", "/transcription/worker/credentials_json")
 SSM_TOKEN_PARAM = os.getenv("SSM_TOKEN_PARAM", "/transcription/worker/token_json")
@@ -64,8 +64,12 @@ SSM_TOKEN_PARAM = os.getenv("SSM_TOKEN_PARAM", "/transcription/worker/token_json
 # CloudWatch worker logs
 WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
 
-# If true, worker ends with shutdown (you MUST set Launch Template shutdown behavior = Terminate)
+# Recommended: worker ends with shutdown; Launch Template must be "Terminate on shutdown"
 USE_SHUTDOWN_TERMINATE = os.getenv("USE_SHUTDOWN_TERMINATE", "1").strip().lower() in ("1", "true", "yes", "y")
+
+# Google API retries (Drive sometimes returns 500 Internal Error)
+GOOGLE_EXECUTE_RETRIES = int(os.getenv("GOOGLE_EXECUTE_RETRIES", "8"))
+GOOGLE_PAGE_SIZE = int(os.getenv("GOOGLE_PAGE_SIZE", "500"))  # reduce from 1000 to reduce Drive flakiness
 
 # -----------------------------
 # AWS client
@@ -93,8 +97,6 @@ def build_drive():
 
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
-
-        # token.json is mounted read-only; write refreshed token elsewhere
         try:
             TOKEN_FILE_WRITE.parent.mkdir(parents=True, exist_ok=True)
             TOKEN_FILE_WRITE.write_text(creds.to_json(), encoding="utf-8")
@@ -112,13 +114,14 @@ def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None):
 
     token = None
     while True:
-        res = drive.files().list(
+        req = drive.files().list(
             q=q,
             fields="nextPageToken, files(id,name,mimeType,modifiedTime)",
-            pageSize=1000,
+            pageSize=GOOGLE_PAGE_SIZE,
             pageToken=token,
             **_list_kwargs(),
-        ).execute()
+        )
+        res = req.execute(num_retries=GOOGLE_EXECUTE_RETRIES)
         yield from res.get("files", [])
         token = res.get("nextPageToken")
         if not token:
@@ -135,13 +138,14 @@ def drive_search_folder_anywhere(drive, folder_name: str) -> List[dict]:
     out: List[dict] = []
     token = None
     while True:
-        res = drive.files().list(
+        req = drive.files().list(
             q=q,
             fields="nextPageToken, files(id,name,parents,modifiedTime)",
-            pageSize=1000,
+            pageSize=GOOGLE_PAGE_SIZE,
             pageToken=token,
             **_list_kwargs(),
-        ).execute()
+        )
+        res = req.execute(num_retries=GOOGLE_EXECUTE_RETRIES)
         out.extend(res.get("files", []))
         token = res.get("nextPageToken")
         if not token:
@@ -196,6 +200,7 @@ def find_tasks(drive) -> List[Dict]:
             children = list(drive_list_children(drive, folder_id, None))
             videos = [f for f in children if f["mimeType"] != FOLDER_MIME and is_video(f["name"])]
 
+            # NOTE: drive_find_child() is a scan; ok for now. If scale grows, optimize by building a name set.
             for vid in videos:
                 out = transcript_name(vid["name"])
                 if drive_find_child(drive, folder_id, out, None):
@@ -214,7 +219,8 @@ def find_tasks(drive) -> List[Dict]:
 
 # -----------------------------
 # FULL worker bootstrap user-data
-# (This replaces the broken "inject only exports" user-data)
+# IMPORTANT: If you pass UserData in run_instances, it OVERRIDES Launch Template user-data.
+# This template includes exports + full bootstrap, so worker actually runs test2.py.
 # -----------------------------
 WORKER_USERDATA_TEMPLATE = r"""#!/bin/bash
 set -euo pipefail
@@ -250,7 +256,7 @@ dnf update -y
 dnf install -y git python3-pip ffmpeg jq awscli amazon-cloudwatch-agent
 python3 -m pip install --upgrade pip
 
-# CloudWatch log streaming (optional, but recommended)
+# CloudWatch log streaming
 cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
 {{
   "logs": {{
