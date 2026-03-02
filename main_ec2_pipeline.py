@@ -24,6 +24,7 @@ LAUNCH_TEMPLATE_VERSION = os.getenv("WORKER_LAUNCH_TEMPLATE_VERSION", "$Default"
 ROOT_2026_FOLDER_NAME = os.getenv("ROOT_2026_FOLDER_NAME", "2026")
 SLOT_CHOICE = os.getenv("SLOT_CHOICE", "").strip()  # 1-based index
 USE_SHARED_DRIVES = os.getenv("USE_SHARED_DRIVES", "0").strip().lower() in ("1", "true", "yes", "y")
+USE_SHARED_DRIVES_STR = "1" if USE_SHARED_DRIVES else "0"
 
 TOKEN_FILE = Path(os.getenv("TOKEN_FILE", "token.json"))
 TOKEN_FILE_WRITE = Path(os.getenv("TOKEN_FILE_WRITE", "/app/state/token_refreshed.json"))
@@ -69,18 +70,28 @@ SSM_TOKEN_PARAM = os.getenv("SSM_TOKEN_PARAM", "/transcription/worker/token_json
 WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
 
 # Worker image in ECR
-AWS_ACCOUNT_ID = os.getenv("AWS_ACCOUNT_ID", "").strip()  # recommended to set in .env
 WORKER_ECR_REPO = os.getenv("WORKER_ECR_REPO", "transcription-worker").strip()
 WORKER_IMAGE_TAG = os.getenv("WORKER_IMAGE_TAG", "latest").strip()
+
+# Worker whisper defaults (stable for CPU instances)
+WORKER_WHISPER_MODEL = os.getenv("WORKER_WHISPER_MODEL", "medium").strip()
+WORKER_DEVICE = os.getenv("WORKER_DEVICE", "cpu").strip()
+WORKER_COMPUTE_TYPE = os.getenv("WORKER_COMPUTE_TYPE", "int8").strip()
+WORKER_LANGUAGE = os.getenv("WORKER_LANGUAGE", "en").strip()
+WORKER_USE_VAD = os.getenv("WORKER_USE_VAD", "true").strip().lower()
+WORKER_CHUNK_SECONDS = os.getenv("WORKER_CHUNK_SECONDS", "540").strip()
+WORKER_OVERLAP_SECONDS = os.getenv("WORKER_OVERLAP_SECONDS", "2").strip()
 
 # Worker termination model:
 # IMPORTANT: Set Launch Template "Shutdown behavior" = Terminate
 USE_SHUTDOWN_TERMINATE = os.getenv("USE_SHUTDOWN_TERMINATE", "1").strip().lower() in ("1", "true", "yes", "y")
 
 # -----------------------------
-# AWS client
+# AWS clients
 # -----------------------------
 ec2 = boto3.client("ec2", region_name=AWS_REGION)
+sts = boto3.client("sts", region_name=AWS_REGION)
+AWS_ACCOUNT_ID = os.getenv("AWS_ACCOUNT_ID", "").strip() or sts.get_caller_identity()["Account"]
 
 # -----------------------------
 # Drive helpers
@@ -227,8 +238,6 @@ def _sanitize_stream_name(s: str) -> str:
 
 # -----------------------------
 # WORKER USERDATA (Docker pull + docker run)
-# Worker EC2 only installs docker, pulls ECR image, runs worker_entrypoint.py inside container.
-# Logs go to CloudWatch via awslogs driver.
 # -----------------------------
 WORKER_USERDATA_TEMPLATE = r"""#!/bin/bash
 set -euo pipefail
@@ -240,6 +249,9 @@ export VIDEO_NAME="{VIDEO_NAME}"
 exec > >(tee -a /var/log/worker-userdata.log) 2>&1
 echo "[BOOT] Worker starting..."
 date
+
+# Always shutdown on exit (prevents stuck workers)
+{EXIT_TRAP}
 
 # IMDSv2
 TOKEN="$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)"
@@ -274,7 +286,8 @@ aws ecr get-login-password --region "$REGION" \
 
 docker pull "$IMAGE_URI"
 
-# Run worker container (logs -> CloudWatch)
+echo "[BOOT] Starting container..."
+set +e
 docker run --rm \
   --name transcription-worker \
   --log-driver awslogs \
@@ -286,31 +299,33 @@ docker run --rm \
   -e VIDEO_FILE_ID="$VIDEO_FILE_ID" \
   -e TARGET_FOLDER_ID="$TARGET_FOLDER_ID" \
   -e VIDEO_NAME="$VIDEO_NAME" \
+  -e USE_SHARED_DRIVES="{USE_SHARED_DRIVES}" \
+  -e WHISPER_MODEL="{WHISPER_MODEL}" \
+  -e DEVICE="{DEVICE}" \
+  -e COMPUTE_TYPE="{COMPUTE_TYPE}" \
+  -e LANGUAGE="{LANGUAGE}" \
+  -e USE_VAD="{USE_VAD}" \
+  -e CHUNK_SECONDS="{CHUNK_SECONDS}" \
+  -e OVERLAP_SECONDS="{OVERLAP_SECONDS}" \
   -e SSM_ENV_PARAM="{SSM_ENV_PARAM}" \
   -e SSM_CREDENTIALS_PARAM="{SSM_CREDENTIALS_PARAM}" \
   -e SSM_TOKEN_PARAM="{SSM_TOKEN_PARAM}" \
   "$IMAGE_URI" \
-  python worker_entrypoint.py
+  python -u /app/worker_entrypoint.py
+RC=$?
+echo "[BOOT] Container exit code=$RC"
+set -e
 
 echo "[BOOT] Done."
-
-if [[ "{USE_SHUTDOWN_TERMINATE}" == "1" ]]; then
-  echo "[BOOT] shutdown -h now (Launch Template must be Terminate-on-shutdown)"
-  shutdown -h now
-else
-  echo "[BOOT] WARNING: USE_SHUTDOWN_TERMINATE=0 -> instance will remain running"
-fi
 """
 
-# -----------------------------
-# EC2 Launch
-# -----------------------------
 def launch_one_worker(task: Dict) -> str:
-    if not AWS_ACCOUNT_ID:
-        raise RuntimeError("Set AWS_ACCOUNT_ID in orchestrator .env (needed to build ECR image URI).")
-
-    stream = _sanitize_stream_name(f"{task['video_name']}")
+    stream = _sanitize_stream_name(task["video_name"])
     log_stream = f"{RUN_ID}/{stream}"
+
+    exit_trap = ""
+    if USE_SHUTDOWN_TERMINATE:
+        exit_trap = "trap 'echo \"[BOOT] EXIT trap -> shutdown\"; shutdown -h now' EXIT"
 
     ud = WORKER_USERDATA_TEMPLATE.format(
         VIDEO_FILE_ID=task["video_file_id"],
@@ -321,10 +336,18 @@ def launch_one_worker(task: Dict) -> str:
         WORKER_IMAGE_TAG=WORKER_IMAGE_TAG,
         WORKER_LOG_GROUP=WORKER_LOG_GROUP,
         LOG_STREAM=log_stream,
+        EXIT_TRAP=exit_trap,
+        USE_SHARED_DRIVES=USE_SHARED_DRIVES_STR,
+        WHISPER_MODEL=WORKER_WHISPER_MODEL,
+        DEVICE=WORKER_DEVICE,
+        COMPUTE_TYPE=WORKER_COMPUTE_TYPE,
+        LANGUAGE=WORKER_LANGUAGE,
+        USE_VAD=WORKER_USE_VAD,
+        CHUNK_SECONDS=WORKER_CHUNK_SECONDS,
+        OVERLAP_SECONDS=WORKER_OVERLAP_SECONDS,
         SSM_ENV_PARAM=SSM_ENV_PARAM,
         SSM_CREDENTIALS_PARAM=SSM_CREDENTIALS_PARAM,
         SSM_TOKEN_PARAM=SSM_TOKEN_PARAM,
-        USE_SHUTDOWN_TERMINATE="1" if USE_SHUTDOWN_TERMINATE else "0",
     )
     ud_b64 = base64.b64encode(ud.encode("utf-8")).decode("utf-8")
 

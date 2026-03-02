@@ -92,7 +92,7 @@ EDITOR_EMAILS = [
 ]
 
 # =========================
-# ✅ Thresholds (PERCENT)
+#  Thresholds (PERCENT)
 # =========================
 THRESHOLDS_PCT: Dict[str, float] = {
     "3. Introduction Video": 75.0,

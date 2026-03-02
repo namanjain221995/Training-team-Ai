@@ -35,6 +35,7 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build & push worker image to ECR
+        id: ecr
         env:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           ECR_REPO: ${{ secrets.WORKER_ECR_REPO }}   # e.g. transcription-worker
@@ -48,6 +49,10 @@ jobs:
 
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+
+          echo "IMAGE_URI=${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
           echo "Pushing to: ${IMAGE_URI}"
 
@@ -138,6 +143,8 @@ jobs:
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
+          WORKER_IMAGE_TAG: ${{ steps.ecr.outputs.tag }}
+          WORKER_ECR_REPO: ${{ secrets.WORKER_ECR_REPO }}
         with:
           host: ${{ steps.ec2ip.outputs.public_ip }}
           username: ${{ secrets.EC2_USER }}
@@ -145,7 +152,7 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 60m
-          envs: EC2_PATH
+          envs: EC2_PATH,WORKER_IMAGE_TAG,WORKER_ECR_REPO
           script: |
             set -euo pipefail
             cd "$EC2_PATH"
@@ -158,6 +165,20 @@ jobs:
             echo "== Ensure docker running =="
             sudo systemctl enable docker || true
             sudo systemctl start docker || true
+
+            echo "== Update worker image settings in .env =="
+            # pin workers to this commit tag (safer than latest)
+            if grep -q "^WORKER_ECR_REPO=" .env; then
+              sed -i "s/^WORKER_ECR_REPO=.*/WORKER_ECR_REPO=${WORKER_ECR_REPO}/" .env
+            else
+              echo "WORKER_ECR_REPO=${WORKER_ECR_REPO}" >> .env
+            fi
+
+            if grep -q "^WORKER_IMAGE_TAG=" .env; then
+              sed -i "s/^WORKER_IMAGE_TAG=.*/WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG}/" .env
+            else
+              echo "WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG}" >> .env
+            fi
 
             echo "== Choose compose command =="
             if command -v docker-compose >/dev/null 2>&1; then

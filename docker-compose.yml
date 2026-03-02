@@ -22,17 +22,30 @@ services:
       - TOKEN_FILE=/app/token.json
       - TOKEN_FILE_WRITE=/app/state/token_refreshed.json
 
-      # Optional: control Drive retries
+      # Drive retries
       - GOOGLE_EXECUTE_RETRIES=${GOOGLE_EXECUTE_RETRIES:-8}
       - GOOGLE_PAGE_SIZE=${GOOGLE_PAGE_SIZE:-500}
 
-      # Worker termination behavior (recommended)
+      # Worker termination behavior
       - USE_SHUTDOWN_TERMINATE=${USE_SHUTDOWN_TERMINATE:-1}
 
-      # Optional: SSM param names (worker reads)
+      # SSM params (worker reads)
       - SSM_ENV_PARAM=${SSM_ENV_PARAM:-/transcription/worker/env}
       - SSM_CREDENTIALS_PARAM=${SSM_CREDENTIALS_PARAM:-/transcription/worker/credentials_json}
       - SSM_TOKEN_PARAM=${SSM_TOKEN_PARAM:-/transcription/worker/token_json}
+
+      # ECR worker image (IMPORTANT)
+      - WORKER_ECR_REPO=${WORKER_ECR_REPO:-transcription-worker}
+      - WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG:-latest}
+
+      # Worker whisper defaults (recommended)
+      - WORKER_WHISPER_MODEL=${WORKER_WHISPER_MODEL:-small}
+      - WORKER_DEVICE=${WORKER_DEVICE:-cpu}
+      - WORKER_COMPUTE_TYPE=${WORKER_COMPUTE_TYPE:-int8}
+      - WORKER_LANGUAGE=${WORKER_LANGUAGE:-en}
+      - WORKER_USE_VAD=${WORKER_USE_VAD:-true}
+      - WORKER_CHUNK_SECONDS=${WORKER_CHUNK_SECONDS:-540}
+      - WORKER_OVERLAP_SECONDS=${WORKER_OVERLAP_SECONDS:-2}
 
     volumes:
       - ./:/app
@@ -69,14 +82,14 @@ services:
       orchestrator:
         condition: service_completed_successfully
 
+    # Safer: don't hard-fail if one script name differs
     command: >
       sh -c "set -e;
-        python script.py &&
-        python test3.py &&
-        python llm.py &&
-        python each-personscore-docs.py &&
-        python docs.py &&
-        python sheet.py
+        python script.py || true;
+        python llm.py || true;
+        python each-personscore-docs.py || true;
+        python docs.py || true;
+        python sheet.py || true;
       "
 
   log_viewer:

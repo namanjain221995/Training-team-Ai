@@ -17,5 +17,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# default command (overridden in user-data to: python worker_entrypoint.py)
 CMD ["bash"]

@@ -24,7 +24,6 @@ def main():
 
     os.makedirs("/app/state", exist_ok=True)
 
-    # Fetch and write files expected by your scripts
     with open("/app/.env", "w", encoding="utf-8") as f:
         f.write(ssm_get(region, env_param))
     with open("/app/credentials.json", "w", encoding="utf-8") as f:
@@ -43,7 +42,7 @@ def main():
         os.environ["VIDEO_NAME"] = video_name
 
     print(f"[WORKER] Starting test2.py for {video_name or video_file_id}")
-    subprocess.run(["python", "test2.py"], check=False)
+    subprocess.run(["python", "-u", "test2.py"], check=False)
 
 if __name__ == "__main__":
     main()

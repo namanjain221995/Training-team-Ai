@@ -5,6 +5,8 @@ __pycache__
 *.pyc
 *.pyo
 .env
+*.pem
+*.key
 .env.local
 token.json
 credentials.json
@@ -12,3 +14,13 @@ credentials.json
 .openai_file_cache.json
 !token.json
 !credentials.json
+
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+*.log
+.tmp_drive_auth/
+app/state/
