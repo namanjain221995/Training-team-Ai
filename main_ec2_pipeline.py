@@ -56,6 +56,17 @@ WAIT_POLL_SECONDS = int(os.getenv("WAIT_POLL_SECONDS", "15"))
 # Unique RunId tag for this run
 RUN_ID = os.getenv("RUN_ID", "") or time.strftime("%Y%m%d_%H%M%S")
 
+# SSM parameters (workers read these)
+SSM_ENV_PARAM = os.getenv("SSM_ENV_PARAM", "/transcription/worker/env")
+SSM_CREDENTIALS_PARAM = os.getenv("SSM_CREDENTIALS_PARAM", "/transcription/worker/credentials_json")
+SSM_TOKEN_PARAM = os.getenv("SSM_TOKEN_PARAM", "/transcription/worker/token_json")
+
+# CloudWatch worker logs
+WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
+
+# If true, worker ends with shutdown (you MUST set Launch Template shutdown behavior = Terminate)
+USE_SHUTDOWN_TERMINATE = os.getenv("USE_SHUTDOWN_TERMINATE", "1").strip().lower() in ("1", "true", "yes", "y")
+
 # -----------------------------
 # AWS client
 # -----------------------------
@@ -202,22 +213,126 @@ def find_tasks(drive) -> List[Dict]:
     return tasks
 
 # -----------------------------
-# Launch workers (per video)
-# Worker Launch Template contains the real logic (docker build/run test2 + terminate).
-# We override only to inject VIDEO_FILE_ID / TARGET_FOLDER_ID / VIDEO_NAME.
+# FULL worker bootstrap user-data
+# (This replaces the broken "inject only exports" user-data)
 # -----------------------------
-USERDATA_INJECT_ONLY = """#!/bin/bash
+WORKER_USERDATA_TEMPLATE = r"""#!/bin/bash
 set -euo pipefail
+
+# Task injected by orchestrator
 export VIDEO_FILE_ID="{VIDEO_FILE_ID}"
 export TARGET_FOLDER_ID="{TARGET_FOLDER_ID}"
 export VIDEO_NAME="{VIDEO_NAME}"
+
+# Log everything
+exec > >(tee -a /var/log/worker-userdata.log) 2>&1
+echo "[BOOT] Worker starting..."
+date
+
+# IMDSv2-safe helpers
+IMDS_TOKEN="$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)"
+imds() {{
+  local path="$1"
+  if [[ -n "${{IMDS_TOKEN}}" ]]; then
+    curl -s -H "X-aws-ec2-metadata-token: ${{IMDS_TOKEN}}" "http://169.254.169.254/latest/${{path}}"
+  else
+    curl -s "http://169.254.169.254/latest/${{path}}"
+  fi
+}}
+
+REGION="$(imds meta-data/placement/region)"
+INSTANCE_ID="$(imds meta-data/instance-id)"
+export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION"
+echo "[BOOT] REGION=$REGION INSTANCE_ID=$INSTANCE_ID"
+
+echo "[BOOT] Installing packages..."
+dnf update -y
+dnf install -y git python3-pip ffmpeg jq awscli amazon-cloudwatch-agent
+python3 -m pip install --upgrade pip
+
+# CloudWatch log streaming (optional, but recommended)
+cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
+{{
+  "logs": {{
+    "logs_collected": {{
+      "files": {{
+        "collect_list": [
+          {{
+            "file_path": "/var/log/worker-userdata.log",
+            "log_group_name": "{WORKER_LOG_GROUP}",
+            "log_stream_name": "{{instance_id}}/userdata"
+          }},
+          {{
+            "file_path": "/var/log/cloud-init-output.log",
+            "log_group_name": "{WORKER_LOG_GROUP}",
+            "log_stream_name": "{{instance_id}}/cloud-init"
+          }}
+        ]
+      }}
+    }}
+  }}
+}}
+JSON
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+mkdir -p /app /app/cache
+cd /app
+
+echo "[BOOT] Fetching config from SSM..."
+aws ssm get-parameter --region "$REGION" --name "{SSM_ENV_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/.env
+aws ssm get-parameter --region "$REGION" --name "{SSM_CREDENTIALS_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/credentials.json
+aws ssm get-parameter --region "$REGION" --name "{SSM_TOKEN_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/token.json
+
+set -a
+source /app/.env || true
+set +a
+
+export CREDENTIALS_FILE=/app/credentials.json
+export TOKEN_FILE=/app/token.json
+export TOKEN_FILE_WRITE=/app/token_refreshed.json
+export HEADLESS_AUTH=1
+export XDG_CACHE_HOME=/app/cache
+export HF_HOME=/app/cache
+export TRANSFORMERS_CACHE=/app/cache
+
+echo "[BOOT] Cloning repo..."
+rm -rf repo
+git clone --depth 1 https://github.com/namanjain221995/Training-team-Ai.git repo
+cd repo
+
+echo "[BOOT] Installing requirements..."
+python3 -m pip install -r requirements.txt
+
+echo "[BOOT] Running test2.py..."
+python3 test2.py || true
+
+echo "[BOOT] Finished VIDEO_NAME=$VIDEO_NAME"
+
+if [[ "{USE_SHUTDOWN_TERMINATE}" == "1" ]]; then
+  echo "[BOOT] Shutdown now (Launch Template must be set to Terminate on shutdown)..."
+  shutdown -h now
+else
+  echo "[BOOT] Terminate via EC2 API..."
+  aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID" || true
+fi
 """
 
+# -----------------------------
+# Launch workers (per video)
+# -----------------------------
 def launch_one_worker(task: Dict) -> str:
-    ud = USERDATA_INJECT_ONLY.format(
+    ud = WORKER_USERDATA_TEMPLATE.format(
         VIDEO_FILE_ID=task["video_file_id"],
         TARGET_FOLDER_ID=task["target_folder_id"],
         VIDEO_NAME=task["video_name"].replace('"', "'"),
+        WORKER_LOG_GROUP=WORKER_LOG_GROUP,
+        SSM_ENV_PARAM=SSM_ENV_PARAM,
+        SSM_CREDENTIALS_PARAM=SSM_CREDENTIALS_PARAM,
+        SSM_TOKEN_PARAM=SSM_TOKEN_PARAM,
+        USE_SHUTDOWN_TERMINATE="1" if USE_SHUTDOWN_TERMINATE else "0",
     )
     ud_b64 = base64.b64encode(ud.encode("utf-8")).decode("utf-8")
 

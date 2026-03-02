@@ -36,23 +36,21 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 LAUNCH_TEMPLATE_ID = os.getenv("WORKER_LAUNCH_TEMPLATE_ID", "").strip()  # lt-...
 LAUNCH_TEMPLATE_VERSION = os.getenv("WORKER_LAUNCH_TEMPLATE_VERSION", "$Latest")
 
-# Throttle to avoid AWS API throttles
 LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.25"))
+MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "1"))  # default 2 to match your example
 
-# 0 = no limit (launch all)
-MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "1"))
-
-# Drive token/credentials fetched from SSM
 SSM_ENV_PARAM = os.getenv("SSM_ENV_PARAM", "/transcription/worker/env")
 SSM_CREDENTIALS_PARAM = os.getenv("SSM_CREDENTIALS_PARAM", "/transcription/worker/credentials_json")
 SSM_TOKEN_PARAM = os.getenv("SSM_TOKEN_PARAM", "/transcription/worker/token_json")
 
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES", "0").strip().lower() in ("1", "true", "yes", "y"))
-
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-# CloudWatch worker logs
 WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
+
+# If you set Launch Template "Shutdown behavior = Terminate" (recommended),
+# worker will terminate with shutdown and you do NOT need ec2:TerminateInstances.
+USE_SHUTDOWN_TERMINATE = os.getenv("USE_SHUTDOWN_TERMINATE", "1").strip().lower() in ("1", "true", "yes", "y")
 
 # ---------------------------
 # Helpers: SSM fetch
@@ -135,10 +133,6 @@ def transcript_output_name(video_name: str) -> str:
 # Drive auth (non-interactive)
 # ---------------------------
 def build_drive_service(credentials_json_text: str, token_json_text: str):
-    """
-    Write creds/token to disk (Google libs work best with file paths).
-    NOTE: In GitHub Actions we NEVER do interactive auth.
-    """
     work = Path(".tmp_drive_auth")
     work.mkdir(exist_ok=True)
     cred_path = work / "credentials.json"
@@ -155,15 +149,14 @@ def build_drive_service(credentials_json_text: str, token_json_text: str):
             creds.refresh(Request())
             token_path.write_text(creds.to_json(), encoding="utf-8")
         else:
-            raise RuntimeError("Drive token is missing/invalid. Update /transcription/worker/token_json in SSM.")
+            raise RuntimeError("Drive token missing/invalid. Update /transcription/worker/token_json in SSM.")
 
     return build("drive", "v3", credentials=creds)
 
 # ---------------------------
-# Worker UserData template (FULL + CloudWatch Logs)
-# We override UserData per-instance so each worker knows which video to process.
+# Worker UserData template (FULL)
 # ---------------------------
-WORKER_USERDATA_TEMPLATE = """#!/bin/bash
+WORKER_USERDATA_TEMPLATE = r"""#!/bin/bash
 set -euo pipefail
 
 # Log everything
@@ -171,18 +164,38 @@ exec > >(tee -a /var/log/worker-userdata.log) 2>&1
 echo "[BOOT] Worker starting..."
 date
 
+# --- IMDSv2 helpers ---
+IMDS_TOKEN="$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)"
+
+imds() {{
+  local path="$1"
+  if [[ -n "${{IMDS_TOKEN}}" ]]; then
+    curl -s -H "X-aws-ec2-metadata-token: ${{IMDS_TOKEN}}" "http://169.254.169.254/latest/${{path}}"
+  else
+    curl -s "http://169.254.169.254/latest/${{path}}"
+  fi
+}}
+
+REGION="$(imds meta-data/placement/region)"
+INSTANCE_ID="$(imds meta-data/instance-id)"
+export AWS_REGION="$REGION"
+export AWS_DEFAULT_REGION="$REGION"
+echo "[BOOT] REGION=$REGION INSTANCE_ID=$INSTANCE_ID"
+
 # Injected task
 export VIDEO_FILE_ID="{VIDEO_FILE_ID}"
 export TARGET_FOLDER_ID="{TARGET_FOLDER_ID}"
 export VIDEO_NAME="{VIDEO_NAME}"
 
-# deps
+echo "[BOOT] Installing packages..."
 dnf update -y
-dnf install -y git python3-pip ffmpeg jq amazon-cloudwatch-agent
+dnf install -y git python3-pip ffmpeg jq awscli amazon-cloudwatch-agent
 python3 -m pip install --upgrade pip
 
-# CloudWatch log streaming
-cat >/opt/aws/amazon-cloudwatch-agent/bin/config.json <<'EOF'
+# CloudWatch log streaming (standard config path)
+echo "[BOOT] Starting CloudWatch Agent..."
+cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
 {{
   "logs": {{
     "logs_collected": {{
@@ -191,26 +204,60 @@ cat >/opt/aws/amazon-cloudwatch-agent/bin/config.json <<'EOF'
           {{
             "file_path": "/var/log/worker-userdata.log",
             "log_group_name": "{WORKER_LOG_GROUP}",
-            "log_stream_name": "{{instance_id}}"
+            "log_stream_name": "{{
+              "Fn::Sub": "${{INSTANCE_ID}}/userdata"
+            }}"
+          }},
+          {{
+            "file_path": "/var/log/cloud-init-output.log",
+            "log_group_name": "{WORKER_LOG_GROUP}",
+            "log_stream_name": "{{
+              "Fn::Sub": "${{INSTANCE_ID}}/cloud-init"
+            }}"
           }}
         ]
       }}
     }}
   }}
 }}
-EOF
+JSON
 
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \\
-  -a fetch-config -m ec2 \\
-  -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
+# CloudWatch Agent doesn't support Fn::Sub; keep it simple:
+# overwrite with a working config using placeholders supported by agent
+cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON2'
+{
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/worker-userdata.log",
+            "log_group_name": "{WORKER_LOG_GROUP}",
+            "log_stream_name": "{instance_id}/userdata"
+          },
+          {
+            "file_path": "/var/log/cloud-init-output.log",
+            "log_group_name": "{WORKER_LOG_GROUP}",
+            "log_stream_name": "{instance_id}/cloud-init"
+          }
+        ]
+      }
+    }
+  }
+}
+JSON2
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
 
 mkdir -p /app /app/cache
 cd /app
 
 echo "[BOOT] Fetching config from SSM..."
-aws ssm get-parameter --name "{SSM_ENV_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/.env
-aws ssm get-parameter --name "{SSM_CREDENTIALS_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/credentials.json
-aws ssm get-parameter --name "{SSM_TOKEN_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/token.json
+aws ssm get-parameter --region "$REGION" --name "{SSM_ENV_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/.env
+aws ssm get-parameter --region "$REGION" --name "{SSM_CREDENTIALS_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/credentials.json
+aws ssm get-parameter --region "$REGION" --name "{SSM_TOKEN_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/token.json
 
 set -a
 source /app/.env || true
@@ -218,6 +265,7 @@ set +a
 
 export CREDENTIALS_FILE=/app/credentials.json
 export TOKEN_FILE=/app/token.json
+export TOKEN_FILE_WRITE=/app/token_refreshed.json
 export HEADLESS_AUTH=1
 export XDG_CACHE_HOME=/app/cache
 export HF_HOME=/app/cache
@@ -234,10 +282,15 @@ python3 -m pip install -r requirements.txt
 echo "[BOOT] Running test2.py..."
 python3 test2.py || true
 
-echo "[BOOT] Terminating instance..."
-INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
-aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID"
+echo "[BOOT] Finished job for VIDEO_NAME=$VIDEO_NAME"
+
+if [[ "{USE_SHUTDOWN_TERMINATE}" == "1" ]]; then
+  echo "[BOOT] Shutting down (Launch Template should be set to Terminate on shutdown)..."
+  sudo shutdown -h now
+else
+  echo "[BOOT] Terminating instance via EC2 API..."
+  aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID" || true
+fi
 """
 
 # ---------------------------
@@ -251,8 +304,7 @@ def find_pending_tasks(drive) -> List[Dict]:
     roots.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
     root_id = roots[0]["id"]
 
-    # Slot selection: use SLOT_CHOICE env var index (1-based). Default: first slot.
-    slot_choice = os.getenv("SLOT_CHOICE", "4").strip()
+    slot_choice = os.getenv("SLOT_CHOICE", "1").strip()
     slot_folders = sorted(list(drive_list_children(drive, root_id, FOLDER_MIME)), key=lambda x: x["name"].lower())
     if not slot_folders:
         raise RuntimeError("No slot folders found under 2026.")
@@ -306,6 +358,7 @@ def launch_worker(ec2, task: Dict) -> str:
         SSM_ENV_PARAM=SSM_ENV_PARAM,
         SSM_CREDENTIALS_PARAM=SSM_CREDENTIALS_PARAM,
         SSM_TOKEN_PARAM=SSM_TOKEN_PARAM,
+        USE_SHUTDOWN_TERMINATE="1" if USE_SHUTDOWN_TERMINATE else "0",
     )
     userdata_b64 = base64.b64encode(userdata.encode("utf-8")).decode("utf-8")
 
@@ -342,12 +395,11 @@ def launch_worker(ec2, task: Dict) -> str:
 
 def main():
     if not LAUNCH_TEMPLATE_ID:
-        raise RuntimeError("Missing WORKER_LAUNCH_TEMPLATE_ID env var (set it as GitHub Secret).")
+        raise RuntimeError("Missing WORKER_LAUNCH_TEMPLATE_ID env var.")
 
     ssm = boto3.client("ssm", region_name=AWS_REGION)
     ec2 = boto3.client("ec2", region_name=AWS_REGION)
 
-    # Read Drive auth from SSM
     credentials_json_text = ssm_get(ssm, SSM_CREDENTIALS_PARAM, with_decryption=True)
     token_json_text = ssm_get(ssm, SSM_TOKEN_PARAM, with_decryption=True)
 
