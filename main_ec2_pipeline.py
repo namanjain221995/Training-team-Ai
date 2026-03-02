@@ -14,7 +14,7 @@ from google.auth.transport.requests import Request
 load_dotenv()
 
 # -----------------------------
-# CONFIG (from .env on MAIN EC2 / orchestrator container)
+# CONFIG (orchestrator container)
 # -----------------------------
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
@@ -56,20 +56,26 @@ WAIT_POLL_SECONDS = int(os.getenv("WAIT_POLL_SECONDS", "15"))
 # Unique RunId tag for this run
 RUN_ID = os.getenv("RUN_ID", "") or time.strftime("%Y%m%d_%H%M%S")
 
-# Worker reads these from SSM (parameter names)
+# Drive flakiness (500 Internal Error) -> retries
+GOOGLE_EXECUTE_RETRIES = int(os.getenv("GOOGLE_EXECUTE_RETRIES", "8"))
+GOOGLE_PAGE_SIZE = int(os.getenv("GOOGLE_PAGE_SIZE", "500"))
+
+# Worker SSM parameter names (used inside container)
 SSM_ENV_PARAM = os.getenv("SSM_ENV_PARAM", "/transcription/worker/env")
 SSM_CREDENTIALS_PARAM = os.getenv("SSM_CREDENTIALS_PARAM", "/transcription/worker/credentials_json")
 SSM_TOKEN_PARAM = os.getenv("SSM_TOKEN_PARAM", "/transcription/worker/token_json")
 
-# CloudWatch worker logs
+# CloudWatch group for docker logs (awslogs driver)
 WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
 
-# Recommended: worker ends with shutdown; Launch Template must be "Terminate on shutdown"
-USE_SHUTDOWN_TERMINATE = os.getenv("USE_SHUTDOWN_TERMINATE", "1").strip().lower() in ("1", "true", "yes", "y")
+# Worker image in ECR
+AWS_ACCOUNT_ID = os.getenv("AWS_ACCOUNT_ID", "").strip()  # recommended to set in .env
+WORKER_ECR_REPO = os.getenv("WORKER_ECR_REPO", "transcription-worker").strip()
+WORKER_IMAGE_TAG = os.getenv("WORKER_IMAGE_TAG", "latest").strip()
 
-# Google API retries (Drive sometimes returns 500 Internal Error)
-GOOGLE_EXECUTE_RETRIES = int(os.getenv("GOOGLE_EXECUTE_RETRIES", "8"))
-GOOGLE_PAGE_SIZE = int(os.getenv("GOOGLE_PAGE_SIZE", "500"))  # reduce from 1000 to reduce Drive flakiness
+# Worker termination model:
+# IMPORTANT: Set Launch Template "Shutdown behavior" = Terminate
+USE_SHUTDOWN_TERMINATE = os.getenv("USE_SHUTDOWN_TERMINATE", "1").strip().lower() in ("1", "true", "yes", "y")
 
 # -----------------------------
 # AWS client
@@ -85,11 +91,6 @@ def _list_kwargs():
     return {}
 
 def build_drive():
-    """
-    Non-interactive Drive auth on main EC2:
-    token.json must exist (mounted read-only is OK).
-    If refresh happens, we write refreshed token to TOKEN_FILE_WRITE (writable).
-    """
     if not TOKEN_FILE.exists():
         raise RuntimeError(f"token.json not found at {TOKEN_FILE}. Mount it into orchestrator container.")
 
@@ -200,7 +201,6 @@ def find_tasks(drive) -> List[Dict]:
             children = list(drive_list_children(drive, folder_id, None))
             videos = [f for f in children if f["mimeType"] != FOLDER_MIME and is_video(f["name"])]
 
-            # NOTE: drive_find_child() is a scan; ok for now. If scale grows, optimize by building a name set.
             for vid in videos:
                 out = transcript_name(vid["name"])
                 if drive_find_child(drive, folder_id, out, None):
@@ -217,124 +217,110 @@ def find_tasks(drive) -> List[Dict]:
 
     return tasks
 
+def _sanitize_stream_name(s: str) -> str:
+    s = s.replace("/", "_").replace("\\", "_").replace(":", "_")
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = s.strip()
+    if len(s) > 200:
+        s = s[:200]
+    return s or "video"
+
 # -----------------------------
-# FULL worker bootstrap user-data
-# IMPORTANT: If you pass UserData in run_instances, it OVERRIDES Launch Template user-data.
-# This template includes exports + full bootstrap, so worker actually runs test2.py.
+# WORKER USERDATA (Docker pull + docker run)
+# Worker EC2 only installs docker, pulls ECR image, runs worker_entrypoint.py inside container.
+# Logs go to CloudWatch via awslogs driver.
 # -----------------------------
 WORKER_USERDATA_TEMPLATE = r"""#!/bin/bash
 set -euo pipefail
 
-# Task injected by orchestrator
 export VIDEO_FILE_ID="{VIDEO_FILE_ID}"
 export TARGET_FOLDER_ID="{TARGET_FOLDER_ID}"
 export VIDEO_NAME="{VIDEO_NAME}"
 
-# Log everything
 exec > >(tee -a /var/log/worker-userdata.log) 2>&1
 echo "[BOOT] Worker starting..."
 date
 
-# IMDSv2-safe helpers
-IMDS_TOKEN="$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)"
+# IMDSv2
+TOKEN="$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)"
 imds() {{
-  local path="$1"
-  if [[ -n "${{IMDS_TOKEN}}" ]]; then
-    curl -s -H "X-aws-ec2-metadata-token: ${{IMDS_TOKEN}}" "http://169.254.169.254/latest/${{path}}"
+  local p="$1"
+  if [[ -n "$TOKEN" ]]; then
+    curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/$p"
   else
-    curl -s "http://169.254.169.254/latest/${{path}}"
+    curl -s "http://169.254.169.254/latest/$p"
   fi
 }}
 
 REGION="$(imds meta-data/placement/region)"
 INSTANCE_ID="$(imds meta-data/instance-id)"
-export AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION"
+export AWS_REGION="$REGION"
+export AWS_DEFAULT_REGION="$REGION"
 echo "[BOOT] REGION=$REGION INSTANCE_ID=$INSTANCE_ID"
 
-echo "[BOOT] Installing packages..."
 dnf update -y
-dnf install -y git python3-pip ffmpeg jq awscli amazon-cloudwatch-agent
-python3 -m pip install --upgrade pip
+dnf install -y docker awscli
+systemctl enable docker
+systemctl start docker
 
-# CloudWatch log streaming
-cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
-{{
-  "logs": {{
-    "logs_collected": {{
-      "files": {{
-        "collect_list": [
-          {{
-            "file_path": "/var/log/worker-userdata.log",
-            "log_group_name": "{WORKER_LOG_GROUP}",
-            "log_stream_name": "{{instance_id}}/userdata"
-          }},
-          {{
-            "file_path": "/var/log/cloud-init-output.log",
-            "log_group_name": "{WORKER_LOG_GROUP}",
-            "log_stream_name": "{{instance_id}}/cloud-init"
-          }}
-        ]
-      }}
-    }}
-  }}
-}}
-JSON
+ACCOUNT_ID="{AWS_ACCOUNT_ID}"
+REPO="{WORKER_ECR_REPO}"
+TAG="{WORKER_IMAGE_TAG}"
+IMAGE_URI="${{ACCOUNT_ID}}.dkr.ecr.${{REGION}}.amazonaws.com/${{REPO}}:${{TAG}}"
+echo "[BOOT] Pulling image: $IMAGE_URI"
 
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-  -a fetch-config -m ec2 \
-  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+aws ecr get-login-password --region "$REGION" \
+  | docker login --username AWS --password-stdin "${{ACCOUNT_ID}}.dkr.ecr.${{REGION}}.amazonaws.com"
 
-mkdir -p /app /app/cache
-cd /app
+docker pull "$IMAGE_URI"
 
-echo "[BOOT] Fetching config from SSM..."
-aws ssm get-parameter --region "$REGION" --name "{SSM_ENV_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/.env
-aws ssm get-parameter --region "$REGION" --name "{SSM_CREDENTIALS_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/credentials.json
-aws ssm get-parameter --region "$REGION" --name "{SSM_TOKEN_PARAM}" --with-decryption --query "Parameter.Value" --output text > /app/token.json
+# Run worker container (logs -> CloudWatch)
+docker run --rm \
+  --name transcription-worker \
+  --log-driver awslogs \
+  --log-opt awslogs-region="$REGION" \
+  --log-opt awslogs-group="{WORKER_LOG_GROUP}" \
+  --log-opt awslogs-stream="{LOG_STREAM}" \
+  --log-opt awslogs-create-group="true" \
+  -e AWS_REGION="$REGION" \
+  -e VIDEO_FILE_ID="$VIDEO_FILE_ID" \
+  -e TARGET_FOLDER_ID="$TARGET_FOLDER_ID" \
+  -e VIDEO_NAME="$VIDEO_NAME" \
+  -e SSM_ENV_PARAM="{SSM_ENV_PARAM}" \
+  -e SSM_CREDENTIALS_PARAM="{SSM_CREDENTIALS_PARAM}" \
+  -e SSM_TOKEN_PARAM="{SSM_TOKEN_PARAM}" \
+  "$IMAGE_URI" \
+  python worker_entrypoint.py
 
-set -a
-source /app/.env || true
-set +a
-
-export CREDENTIALS_FILE=/app/credentials.json
-export TOKEN_FILE=/app/token.json
-export TOKEN_FILE_WRITE=/app/token_refreshed.json
-export HEADLESS_AUTH=1
-export XDG_CACHE_HOME=/app/cache
-export HF_HOME=/app/cache
-export TRANSFORMERS_CACHE=/app/cache
-
-echo "[BOOT] Cloning repo..."
-rm -rf repo
-git clone --depth 1 https://github.com/namanjain221995/Training-team-Ai.git repo
-cd repo
-
-echo "[BOOT] Installing requirements..."
-python3 -m pip install -r requirements.txt
-
-echo "[BOOT] Running test2.py..."
-python3 test2.py || true
-
-echo "[BOOT] Finished VIDEO_NAME=$VIDEO_NAME"
+echo "[BOOT] Done."
 
 if [[ "{USE_SHUTDOWN_TERMINATE}" == "1" ]]; then
-  echo "[BOOT] Shutdown now (Launch Template must be set to Terminate on shutdown)..."
+  echo "[BOOT] shutdown -h now (Launch Template must be Terminate-on-shutdown)"
   shutdown -h now
 else
-  echo "[BOOT] Terminate via EC2 API..."
-  aws ec2 terminate-instances --region "$REGION" --instance-ids "$INSTANCE_ID" || true
+  echo "[BOOT] WARNING: USE_SHUTDOWN_TERMINATE=0 -> instance will remain running"
 fi
 """
 
 # -----------------------------
-# Launch workers (per video)
+# EC2 Launch
 # -----------------------------
 def launch_one_worker(task: Dict) -> str:
+    if not AWS_ACCOUNT_ID:
+        raise RuntimeError("Set AWS_ACCOUNT_ID in orchestrator .env (needed to build ECR image URI).")
+
+    stream = _sanitize_stream_name(f"{task['video_name']}")
+    log_stream = f"{RUN_ID}/{stream}"
+
     ud = WORKER_USERDATA_TEMPLATE.format(
         VIDEO_FILE_ID=task["video_file_id"],
         TARGET_FOLDER_ID=task["target_folder_id"],
         VIDEO_NAME=task["video_name"].replace('"', "'"),
+        AWS_ACCOUNT_ID=AWS_ACCOUNT_ID,
+        WORKER_ECR_REPO=WORKER_ECR_REPO,
+        WORKER_IMAGE_TAG=WORKER_IMAGE_TAG,
         WORKER_LOG_GROUP=WORKER_LOG_GROUP,
+        LOG_STREAM=log_stream,
         SSM_ENV_PARAM=SSM_ENV_PARAM,
         SSM_CREDENTIALS_PARAM=SSM_CREDENTIALS_PARAM,
         SSM_TOKEN_PARAM=SSM_TOKEN_PARAM,
@@ -353,7 +339,7 @@ def launch_one_worker(task: Dict) -> str:
                     "ResourceType": "instance",
                     "Tags": [
                         {"Key": "Name", "Value": "transcription-worker"},
-                        {"Key": "Purpose", "Value": "test2"},
+                        {"Key": "Purpose", "Value": "test2-docker"},
                         {"Key": "RunId", "Value": RUN_ID},
                         {"Key": "Slot", "Value": task["slot"][:256]},
                         {"Key": "Person", "Value": task["person"][:256]},
@@ -375,7 +361,7 @@ def launch_one_worker(task: Dict) -> str:
 def list_active_workers() -> List[str]:
     resp = ec2.describe_instances(
         Filters=[
-            {"Name": "tag:Purpose", "Values": ["test2"]},
+            {"Name": "tag:Purpose", "Values": ["test2-docker"]},
             {"Name": "tag:RunId", "Values": [RUN_ID]},
             {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "shutting-down"]},
         ]
@@ -391,8 +377,8 @@ def main():
         raise RuntimeError("WORKER_LAUNCH_TEMPLATE_ID not set in .env (orchestrator container).")
 
     print(f"[RUN] RUN_ID={RUN_ID} SLOT_CHOICE={SLOT_CHOICE or '1(default)'}")
-
     drive = build_drive()
+
     tasks = find_tasks(drive)
     print(f"[INFO] Pending videos (missing transcripts): {len(tasks)}")
 

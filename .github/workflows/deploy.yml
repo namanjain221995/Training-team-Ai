@@ -19,12 +19,40 @@ jobs:
     timeout-minutes: 90
 
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      # -------------------------
+      # Build + Push WORKER image
+      # -------------------------
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push worker image to ECR
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          ECR_REPO: ${{ secrets.WORKER_ECR_REPO }} # e.g. transcription-worker
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+          echo "Pushing to: $IMAGE_URI"
+
+          docker build -f Dockerfile.worker -t "${IMAGE_URI}:latest" .
+          docker tag "${IMAGE_URI}:latest" "${IMAGE_URI}:${GITHUB_SHA}"
+
+          docker push "${IMAGE_URI}:latest"
+          docker push "${IMAGE_URI}:${GITHUB_SHA}"
+
+      # -------------------------
+      # Deploy main EC2 + compose
+      # -------------------------
       - name: Ensure main EC2 is running
         shell: bash
         run: |
@@ -138,7 +166,6 @@ jobs:
             $COMPOSE ps || true
 
             echo "== Follow orchestrator logs for a while (optional) =="
-            # keep logs short so GitHub action doesn't run forever
             timeout 600 docker logs -f orchestrator || true
 
             echo "== Done. Orchestrator continues on EC2. =="
