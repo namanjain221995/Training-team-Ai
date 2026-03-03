@@ -22,7 +22,7 @@ from google.auth.transport.requests import Request
 
 load_dotenv()
 
-# ========================
+# =========================
 # CONFIG
 # =========================
 ROOT_2026_FOLDER_NAME = "2026"
@@ -48,7 +48,7 @@ OVERLAP_SECONDS = int((os.getenv("OVERLAP_SECONDS") or "2").strip())
 FORCE_RETRANSCRIBE = (os.getenv("FORCE_RETRANSCRIBE") or "").strip().lower() in ("1", "true", "yes", "y")
 
 # IMPORTANT: default to small for t2.micro safety (can override via env)
-WHISPER_MODEL = (os.getenv("WHISPER_MODEL") or "medium").strip()
+WHISPER_MODEL = (os.getenv("WHISPER_MODEL") or "Large").strip()
 DEVICE = (os.getenv("DEVICE") or "cpu").strip()
 COMPUTE_TYPE = (os.getenv("COMPUTE_TYPE") or ("float16" if DEVICE == "cuda" else "int8")).strip()
 LANGUAGE = (os.getenv("LANGUAGE") or "en").strip()

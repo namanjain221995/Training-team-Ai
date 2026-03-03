@@ -74,7 +74,7 @@ WORKER_ECR_REPO = os.getenv("WORKER_ECR_REPO", "transcription-worker").strip()
 WORKER_IMAGE_TAG = os.getenv("WORKER_IMAGE_TAG", "latest").strip()
 
 # Worker whisper defaults (stable for CPU instances)
-WORKER_WHISPER_MODEL = os.getenv("WORKER_WHISPER_MODEL", "medium").strip()
+WORKER_WHISPER_MODEL = os.getenv("WORKER_WHISPER_MODEL", "Large").strip()
 WORKER_DEVICE = os.getenv("WORKER_DEVICE", "cpu").strip()
 WORKER_COMPUTE_TYPE = os.getenv("WORKER_COMPUTE_TYPE", "int8").strip()
 WORKER_LANGUAGE = os.getenv("WORKER_LANGUAGE", "en").strip()
