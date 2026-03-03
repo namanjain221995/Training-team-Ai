@@ -50,7 +50,6 @@ jobs:
           AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
 
-          echo "IMAGE_URI=${IMAGE_URI}"
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
           echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
@@ -66,7 +65,7 @@ jobs:
           docker push "${IMAGE_URI}:${GITHUB_SHA}"
 
       # -------------------------
-      # Deploy main EC2 + compose
+      # Ensure main EC2 is running
       # -------------------------
       - name: Ensure main EC2 is running
         shell: bash
@@ -139,12 +138,16 @@ jobs:
           echo "ERROR: SSH not reachable."
           exit 1
 
-      - name: Deploy + run docker compose on main EC2 (detached)
+      # -------------------------
+      # Deploy + start run_detached.sh (stops EC2 at end, even on failure)
+      # -------------------------
+      - name: Deploy + run pipeline on main EC2 (run_detached.sh)
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
           WORKER_IMAGE_TAG: ${{ steps.ecr.outputs.tag }}
           WORKER_ECR_REPO: ${{ secrets.WORKER_ECR_REPO }}
+          STOP_ON_FAILURE: "1"
         with:
           host: ${{ steps.ec2ip.outputs.public_ip }}
           username: ${{ secrets.EC2_USER }}
@@ -152,7 +155,7 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 60m
-          envs: EC2_PATH,WORKER_IMAGE_TAG,WORKER_ECR_REPO
+          envs: EC2_PATH,WORKER_IMAGE_TAG,WORKER_ECR_REPO,STOP_ON_FAILURE
           script: |
             set -euo pipefail
             cd "$EC2_PATH"
@@ -167,7 +170,6 @@ jobs:
             sudo systemctl start docker || true
 
             echo "== Update worker image settings in .env =="
-            # pin workers to this commit tag (safer than latest)
             if grep -q "^WORKER_ECR_REPO=" .env; then
               sed -i "s/^WORKER_ECR_REPO=.*/WORKER_ECR_REPO=${WORKER_ECR_REPO}/" .env
             else
@@ -180,23 +182,8 @@ jobs:
               echo "WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG}" >> .env
             fi
 
-            echo "== Choose compose command =="
-            if command -v docker-compose >/dev/null 2>&1; then
-              COMPOSE="docker-compose"
-            else
-              COMPOSE="docker compose"
-            fi
+            echo "== Run detached pipeline (STOP_ON_FAILURE=${STOP_ON_FAILURE}) =="
+            chmod +x run_detached.sh
+            STOP_ON_FAILURE="${STOP_ON_FAILURE}" EC2_PATH="$EC2_PATH" ./run_detached.sh
 
-            echo "== Compose down (clean) =="
-            $COMPOSE down || true
-
-            echo "== Compose up (build, detached) =="
-            $COMPOSE up -d --build
-
-            echo "== Show running containers =="
-            $COMPOSE ps || true
-
-            echo "== Follow orchestrator logs for a while (optional) =="
-            timeout 600 docker logs -f orchestrator || true
-
-            echo "== Done. Orchestrator continues on EC2. =="
+            echo "== run_detached.sh started. Pipeline continues in background on EC2. =="

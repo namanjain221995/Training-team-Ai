@@ -48,7 +48,7 @@ FOLDER_NAMES_TO_PROCESS = [
 ]
 
 # Worker limits
-MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "1"))  # 0 = launch all
+MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "0"))  # 0 = launch all
 LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.25"))
 
 # Wait behavior
