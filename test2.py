@@ -22,7 +22,7 @@ from google.auth.transport.requests import Request
 
 load_dotenv()
 
-# =========================
+# ========================
 # CONFIG
 # =========================
 ROOT_2026_FOLDER_NAME = "2026"
