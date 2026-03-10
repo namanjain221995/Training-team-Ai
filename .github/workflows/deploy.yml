@@ -12,7 +12,7 @@ on:
         default: ""
         type: string
       timezone:
-        description: "Timezone for till command"
+        description: "Timezone for pipeline command"
         required: false
         default: "America/New_York"
         type: string
@@ -50,9 +50,6 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # -------------------------
-      # Build + Push WORKER image
-      # -------------------------
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
@@ -86,9 +83,6 @@ jobs:
           docker push "${IMAGE_URI}:latest"
           docker push "${IMAGE_URI}:${GITHUB_SHA}"
 
-      # -------------------------
-      # Ensure main EC2 is running
-      # -------------------------
       - name: Ensure main EC2 is running
         shell: bash
         run: |
@@ -160,9 +154,6 @@ jobs:
           echo "ERROR: SSH not reachable."
           exit 1
 
-      # -------------------------
-      # Resolve workflow inputs
-      # -------------------------
       - name: Resolve workflow inputs
         id: wfinputs
         shell: bash
@@ -174,11 +165,13 @@ jobs:
             TIMEZONE_INPUT="${{ github.event.inputs.timezone }}"
             CLEAN_FIRST_INPUT="${{ github.event.inputs.clean_first }}"
             TRIGGER_SOURCE_INPUT="${{ github.event.inputs.trigger_source }}"
+            UPDATE_RUNTIME_ENV="true"
           else
             RAW_SLOT=""
-            TIMEZONE_INPUT="America/New_York"
-            CLEAN_FIRST_INPUT="false"
-            TRIGGER_SOURCE_INPUT="push"
+            TIMEZONE_INPUT=""
+            CLEAN_FIRST_INPUT=""
+            TRIGGER_SOURCE_INPUT=""
+            UPDATE_RUNTIME_ENV="false"
           fi
 
           SLOT_CHOICE="$(printf '%s' "$RAW_SLOT" | grep -oE '[0-9]+' | head -n1 || true)"
@@ -187,6 +180,7 @@ jobs:
           echo "timezone_input=${TIMEZONE_INPUT}" >> "$GITHUB_OUTPUT"
           echo "clean_first_input=${CLEAN_FIRST_INPUT}" >> "$GITHUB_OUTPUT"
           echo "trigger_source_input=${TRIGGER_SOURCE_INPUT}" >> "$GITHUB_OUTPUT"
+          echo "update_runtime_env=${UPDATE_RUNTIME_ENV}" >> "$GITHUB_OUTPUT"
 
           echo "Resolved inputs:"
           echo "  raw_slot=${RAW_SLOT}"
@@ -194,10 +188,8 @@ jobs:
           echo "  timezone=${TIMEZONE_INPUT}"
           echo "  clean_first=${CLEAN_FIRST_INPUT}"
           echo "  trigger_source=${TRIGGER_SOURCE_INPUT}"
+          echo "  update_runtime_env=${UPDATE_RUNTIME_ENV}"
 
-      # -------------------------
-      # Deploy + start run_detached.sh
-      # -------------------------
       - name: Deploy + run pipeline on main EC2 (run_detached.sh)
         uses: appleboy/ssh-action@v1.0.3
         env:
@@ -209,6 +201,7 @@ jobs:
           TIMEZONE_INPUT: ${{ steps.wfinputs.outputs.timezone_input }}
           CLEAN_FIRST: ${{ steps.wfinputs.outputs.clean_first_input }}
           TRIGGER_SOURCE: ${{ steps.wfinputs.outputs.trigger_source_input }}
+          UPDATE_RUNTIME_ENV: ${{ steps.wfinputs.outputs.update_runtime_env }}
         with:
           host: ${{ steps.ec2ip.outputs.public_ip }}
           username: ${{ secrets.EC2_USER }}
@@ -216,9 +209,20 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 60m
-          envs: EC2_PATH,WORKER_IMAGE_TAG,WORKER_ECR_REPO,STOP_ON_FAILURE,SLOT_CHOICE,TIMEZONE_INPUT,CLEAN_FIRST,TRIGGER_SOURCE
+          envs: EC2_PATH,WORKER_IMAGE_TAG,WORKER_ECR_REPO,STOP_ON_FAILURE,SLOT_CHOICE,TIMEZONE_INPUT,CLEAN_FIRST,TRIGGER_SOURCE,UPDATE_RUNTIME_ENV
           script: |
-            set -euo pipefail
+            set -euxo pipefail
+
+            EC2_PATH="${EC2_PATH:-/home/ec2-user/transcription-automation}"
+            WORKER_IMAGE_TAG="${WORKER_IMAGE_TAG:-latest}"
+            WORKER_ECR_REPO="${WORKER_ECR_REPO:-transcription-worker}"
+            STOP_ON_FAILURE="${STOP_ON_FAILURE:-1}"
+            SLOT_CHOICE="${SLOT_CHOICE:-}"
+            TIMEZONE_INPUT="${TIMEZONE_INPUT:-}"
+            CLEAN_FIRST="${CLEAN_FIRST:-}"
+            TRIGGER_SOURCE="${TRIGGER_SOURCE:-}"
+            UPDATE_RUNTIME_ENV="${UPDATE_RUNTIME_ENV:-false}"
+
             cd "$EC2_PATH"
 
             echo "== Update code =="
@@ -234,46 +238,35 @@ jobs:
             docker compose down --volumes --rmi all --remove-orphans || true
             docker system prune -a --volumes -f || true
 
-            echo "== Update worker image settings in .env =="
-            if grep -q "^WORKER_ECR_REPO=" .env; then
-              sed -i "s|^WORKER_ECR_REPO=.*|WORKER_ECR_REPO=${WORKER_ECR_REPO}|" .env
-            else
-              echo "WORKER_ECR_REPO=${WORKER_ECR_REPO}" >> .env
-            fi
+            echo "== Ensure .env exists =="
+            touch .env
 
-            if grep -q "^WORKER_IMAGE_TAG=" .env; then
-              sed -i "s|^WORKER_IMAGE_TAG=.*|WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG}|" .env
-            else
-              echo "WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG}" >> .env
-            fi
+            upsert_env() {
+              local key="$1"
+              local value="$2"
+              if grep -q "^${key}=" .env; then
+                sed -i "s|^${key}=.*|${key}=${value}|" .env
+              else
+                echo "${key}=${value}" >> .env
+              fi
+            }
 
-            echo "== Update pipeline trigger settings in .env =="
-            if grep -q "^SLOT_CHOICE=" .env; then
-              sed -i "s|^SLOT_CHOICE=.*|SLOT_CHOICE=${SLOT_CHOICE}|" .env
-            else
-              echo "SLOT_CHOICE=${SLOT_CHOICE}" >> .env
-            fi
+            if [ "$UPDATE_RUNTIME_ENV" = "true" ]; then
+              echo "== workflow_dispatch mode: updating runtime values in server .env =="
 
-            if grep -q "^TIMEZONE_INPUT=" .env; then
-              sed -i "s|^TIMEZONE_INPUT=.*|TIMEZONE_INPUT=${TIMEZONE_INPUT}|" .env
+              upsert_env "WORKER_ECR_REPO" "${WORKER_ECR_REPO}"
+              upsert_env "WORKER_IMAGE_TAG" "${WORKER_IMAGE_TAG}"
+              upsert_env "SLOT_CHOICE" "${SLOT_CHOICE}"
+              upsert_env "TIMEZONE_INPUT" "${TIMEZONE_INPUT}"
+              upsert_env "CLEAN_FIRST" "${CLEAN_FIRST}"
+              upsert_env "TRIGGER_SOURCE" "${TRIGGER_SOURCE}"
             else
-              echo "TIMEZONE_INPUT=${TIMEZONE_INPUT}" >> .env
-            fi
-
-            if grep -q "^CLEAN_FIRST=" .env; then
-              sed -i "s|^CLEAN_FIRST=.*|CLEAN_FIRST=${CLEAN_FIRST}|" .env
-            else
-              echo "CLEAN_FIRST=${CLEAN_FIRST}" >> .env
-            fi
-
-            if grep -q "^TRIGGER_SOURCE=" .env; then
-              sed -i "s|^TRIGGER_SOURCE=.*|TRIGGER_SOURCE=${TRIGGER_SOURCE}|" .env
-            else
-              echo "TRIGGER_SOURCE=${TRIGGER_SOURCE}" >> .env
+              echo "== push mode: keeping existing server .env unchanged =="
             fi
 
             echo "== Run detached pipeline =="
             echo "STOP_ON_FAILURE=${STOP_ON_FAILURE}"
+            echo "UPDATE_RUNTIME_ENV=${UPDATE_RUNTIME_ENV}"
             echo "SLOT_CHOICE=${SLOT_CHOICE}"
             echo "TIMEZONE_INPUT=${TIMEZONE_INPUT}"
             echo "CLEAN_FIRST=${CLEAN_FIRST}"
@@ -285,6 +278,7 @@ jobs:
             TIMEZONE_INPUT="${TIMEZONE_INPUT}" \
             CLEAN_FIRST="${CLEAN_FIRST}" \
             TRIGGER_SOURCE="${TRIGGER_SOURCE}" \
+            UPDATE_RUNTIME_ENV="${UPDATE_RUNTIME_ENV}" \
             EC2_PATH="${EC2_PATH}" \
             ./run_detached.sh
 
