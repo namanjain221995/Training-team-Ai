@@ -15,7 +15,13 @@ services:
       - WORKER_LAUNCH_TEMPLATE_VERSION=${WORKER_LAUNCH_TEMPLATE_VERSION}
 
       - WORKER_LOG_GROUP=/transcription/workers
+
+      # Pipeline trigger/runtime values
       - SLOT_CHOICE=${SLOT_CHOICE}
+      - TIMEZONE_INPUT=${TIMEZONE_INPUT:-America/New_York}
+      - CLEAN_FIRST=${CLEAN_FIRST:-false}
+      - TRIGGER_SOURCE=${TRIGGER_SOURCE:-manual}
+
       - ROOT_2026_FOLDER_NAME=${ROOT_2026_FOLDER_NAME:-2026}
       - USE_SHARED_DRIVES=${USE_SHARED_DRIVES:-0}
 
@@ -39,7 +45,7 @@ services:
       - WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG:-latest}
 
       # Worker whisper defaults (recommended)
-      - WORKER_WHISPER_MODEL=${WORKER_WHISPER_MODEL:-medium}
+      - WORKER_WHISPER_MODEL=${WORKER_WHISPER_MODEL:-large-v3}
       - WORKER_DEVICE=${WORKER_DEVICE:-cpu}
       - WORKER_COMPUTE_TYPE=${WORKER_COMPUTE_TYPE:-int8}
       - WORKER_LANGUAGE=${WORKER_LANGUAGE:-en}
@@ -64,6 +70,12 @@ services:
       - AWS_DEFAULT_REGION=${AWS_REGION}
       - AWS_EC2_METADATA_DISABLED=false
 
+      # Pipeline trigger/runtime values
+      - SLOT_CHOICE=${SLOT_CHOICE}
+      - TIMEZONE_INPUT=${TIMEZONE_INPUT:-America/New_York}
+      - CLEAN_FIRST=${CLEAN_FIRST:-false}
+      - TRIGGER_SOURCE=${TRIGGER_SOURCE:-manual}
+
       - TOKEN_FILE=/app/token.json
       - CREDENTIALS_FILE=/app/credentials.json
       - HEADLESS_AUTH=1
@@ -82,10 +94,20 @@ services:
       orchestrator:
         condition: service_completed_successfully
 
-    # Safer: don't hard-fail if one script name differs
     command: >
       sh -c "set -e;
+        echo '[INFO] pipeline_rest starting';
+        echo '[INFO] SLOT_CHOICE='\"$$SLOT_CHOICE\";
+        echo '[INFO] TIMEZONE_INPUT='\"$$TIMEZONE_INPUT\";
+        echo '[INFO] CLEAN_FIRST='\"$$CLEAN_FIRST\";
+        echo '[INFO] TRIGGER_SOURCE='\"$$TRIGGER_SOURCE\";
+
         python script.py || true;
+        python slack_delete.py || true;
+        python llm.py || true;
+        python each-personscore-docs.py || true;
+        python docs.py || true;
+        python sheet.py || true;
         python final-mail.py || true;
       "
 
@@ -98,6 +120,13 @@ services:
       - AWS_DEFAULT_REGION=${AWS_REGION}
       - AWS_EC2_METADATA_DISABLED=false
       - WORKER_LOG_GROUP=/transcription/workers
+
+      # Pipeline trigger/runtime values
+      - SLOT_CHOICE=${SLOT_CHOICE}
+      - TIMEZONE_INPUT=${TIMEZONE_INPUT:-America/New_York}
+      - CLEAN_FIRST=${CLEAN_FIRST:-false}
+      - TRIGGER_SOURCE=${TRIGGER_SOURCE:-manual}
+
     volumes:
       - ./:/app
     entrypoint: ["bash", "-lc", "sleep infinity"]

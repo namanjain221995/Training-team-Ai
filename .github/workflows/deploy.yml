@@ -3,7 +3,29 @@ name: "EC2 Deploy (Docker Compose: Orchestrator -> Pipeline)"
 on:
   push:
     branches: ["main"]
+
   workflow_dispatch:
+    inputs:
+      slot:
+        description: "Slot name or slot number (example: 2 or slot 2)"
+        required: false
+        default: ""
+        type: string
+      timezone:
+        description: "Timezone for till command"
+        required: false
+        default: "America/New_York"
+        type: string
+      clean_first:
+        description: "Delete old outputs before pipeline"
+        required: false
+        default: "true"
+        type: string
+      trigger_source:
+        description: "Source of trigger"
+        required: false
+        default: "manual"
+        type: string
 
 permissions:
   id-token: write
@@ -38,7 +60,7 @@ jobs:
         id: ecr
         env:
           AWS_REGION: ${{ secrets.AWS_REGION }}
-          ECR_REPO: ${{ secrets.WORKER_ECR_REPO }}   # e.g. transcription-worker
+          ECR_REPO: ${{ secrets.WORKER_ECR_REPO }}
         run: |
           set -euo pipefail
 
@@ -139,7 +161,42 @@ jobs:
           exit 1
 
       # -------------------------
-      # Deploy + start run_detached.sh (stops EC2 at end, even on failure)
+      # Resolve workflow inputs
+      # -------------------------
+      - name: Resolve workflow inputs
+        id: wfinputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW_SLOT="${{ github.event.inputs.slot }}"
+            TIMEZONE_INPUT="${{ github.event.inputs.timezone }}"
+            CLEAN_FIRST_INPUT="${{ github.event.inputs.clean_first }}"
+            TRIGGER_SOURCE_INPUT="${{ github.event.inputs.trigger_source }}"
+          else
+            RAW_SLOT=""
+            TIMEZONE_INPUT="America/New_York"
+            CLEAN_FIRST_INPUT="false"
+            TRIGGER_SOURCE_INPUT="push"
+          fi
+
+          SLOT_CHOICE="$(printf '%s' "$RAW_SLOT" | grep -oE '[0-9]+' | head -n1 || true)"
+
+          echo "slot_choice=${SLOT_CHOICE}" >> "$GITHUB_OUTPUT"
+          echo "timezone_input=${TIMEZONE_INPUT}" >> "$GITHUB_OUTPUT"
+          echo "clean_first_input=${CLEAN_FIRST_INPUT}" >> "$GITHUB_OUTPUT"
+          echo "trigger_source_input=${TRIGGER_SOURCE_INPUT}" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved inputs:"
+          echo "  raw_slot=${RAW_SLOT}"
+          echo "  slot_choice=${SLOT_CHOICE}"
+          echo "  timezone=${TIMEZONE_INPUT}"
+          echo "  clean_first=${CLEAN_FIRST_INPUT}"
+          echo "  trigger_source=${TRIGGER_SOURCE_INPUT}"
+
+      # -------------------------
+      # Deploy + start run_detached.sh
       # -------------------------
       - name: Deploy + run pipeline on main EC2 (run_detached.sh)
         uses: appleboy/ssh-action@v1.0.3
@@ -148,6 +205,10 @@ jobs:
           WORKER_IMAGE_TAG: ${{ steps.ecr.outputs.tag }}
           WORKER_ECR_REPO: ${{ secrets.WORKER_ECR_REPO }}
           STOP_ON_FAILURE: "1"
+          SLOT_CHOICE: ${{ steps.wfinputs.outputs.slot_choice }}
+          TIMEZONE_INPUT: ${{ steps.wfinputs.outputs.timezone_input }}
+          CLEAN_FIRST: ${{ steps.wfinputs.outputs.clean_first_input }}
+          TRIGGER_SOURCE: ${{ steps.wfinputs.outputs.trigger_source_input }}
         with:
           host: ${{ steps.ec2ip.outputs.public_ip }}
           username: ${{ secrets.EC2_USER }}
@@ -155,7 +216,7 @@ jobs:
           port: 22
           script_stop: true
           command_timeout: 60m
-          envs: EC2_PATH,WORKER_IMAGE_TAG,WORKER_ECR_REPO,STOP_ON_FAILURE
+          envs: EC2_PATH,WORKER_IMAGE_TAG,WORKER_ECR_REPO,STOP_ON_FAILURE,SLOT_CHOICE,TIMEZONE_INPUT,CLEAN_FIRST,TRIGGER_SOURCE
           script: |
             set -euo pipefail
             cd "$EC2_PATH"
@@ -169,21 +230,62 @@ jobs:
             sudo systemctl enable docker || true
             sudo systemctl start docker || true
 
+            echo "== Pre-clean docker state on server =="
+            docker compose down --volumes --rmi all --remove-orphans || true
+            docker system prune -a --volumes -f || true
+
             echo "== Update worker image settings in .env =="
             if grep -q "^WORKER_ECR_REPO=" .env; then
-              sed -i "s/^WORKER_ECR_REPO=.*/WORKER_ECR_REPO=${WORKER_ECR_REPO}/" .env
+              sed -i "s|^WORKER_ECR_REPO=.*|WORKER_ECR_REPO=${WORKER_ECR_REPO}|" .env
             else
               echo "WORKER_ECR_REPO=${WORKER_ECR_REPO}" >> .env
             fi
 
             if grep -q "^WORKER_IMAGE_TAG=" .env; then
-              sed -i "s/^WORKER_IMAGE_TAG=.*/WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG}/" .env
+              sed -i "s|^WORKER_IMAGE_TAG=.*|WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG}|" .env
             else
               echo "WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG}" >> .env
             fi
 
-            echo "== Run detached pipeline (STOP_ON_FAILURE=${STOP_ON_FAILURE}) =="
+            echo "== Update pipeline trigger settings in .env =="
+            if grep -q "^SLOT_CHOICE=" .env; then
+              sed -i "s|^SLOT_CHOICE=.*|SLOT_CHOICE=${SLOT_CHOICE}|" .env
+            else
+              echo "SLOT_CHOICE=${SLOT_CHOICE}" >> .env
+            fi
+
+            if grep -q "^TIMEZONE_INPUT=" .env; then
+              sed -i "s|^TIMEZONE_INPUT=.*|TIMEZONE_INPUT=${TIMEZONE_INPUT}|" .env
+            else
+              echo "TIMEZONE_INPUT=${TIMEZONE_INPUT}" >> .env
+            fi
+
+            if grep -q "^CLEAN_FIRST=" .env; then
+              sed -i "s|^CLEAN_FIRST=.*|CLEAN_FIRST=${CLEAN_FIRST}|" .env
+            else
+              echo "CLEAN_FIRST=${CLEAN_FIRST}" >> .env
+            fi
+
+            if grep -q "^TRIGGER_SOURCE=" .env; then
+              sed -i "s|^TRIGGER_SOURCE=.*|TRIGGER_SOURCE=${TRIGGER_SOURCE}|" .env
+            else
+              echo "TRIGGER_SOURCE=${TRIGGER_SOURCE}" >> .env
+            fi
+
+            echo "== Run detached pipeline =="
+            echo "STOP_ON_FAILURE=${STOP_ON_FAILURE}"
+            echo "SLOT_CHOICE=${SLOT_CHOICE}"
+            echo "TIMEZONE_INPUT=${TIMEZONE_INPUT}"
+            echo "CLEAN_FIRST=${CLEAN_FIRST}"
+            echo "TRIGGER_SOURCE=${TRIGGER_SOURCE}"
+
             chmod +x run_detached.sh
-            STOP_ON_FAILURE="${STOP_ON_FAILURE}" EC2_PATH="$EC2_PATH" ./run_detached.sh
+            STOP_ON_FAILURE="${STOP_ON_FAILURE}" \
+            SLOT_CHOICE="${SLOT_CHOICE}" \
+            TIMEZONE_INPUT="${TIMEZONE_INPUT}" \
+            CLEAN_FIRST="${CLEAN_FIRST}" \
+            TRIGGER_SOURCE="${TRIGGER_SOURCE}" \
+            EC2_PATH="${EC2_PATH}" \
+            ./run_detached.sh
 
             echo "== run_detached.sh started. Pipeline continues in background on EC2. =="

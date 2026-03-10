@@ -23,12 +23,23 @@ echo "$RUN_ID" > "$EC2_PATH/LAST_RUN_ID"
 # If 1 -> stop EC2 even if pipeline_rest fails
 STOP_ON_FAILURE="${STOP_ON_FAILURE:-0}"
 
+# New runtime trigger values
+SLOT_CHOICE="${SLOT_CHOICE:-}"
+TIMEZONE_INPUT="${TIMEZONE_INPUT:-America/New_York}"
+CLEAN_FIRST="${CLEAN_FIRST:-false}"
+TRIGGER_SOURCE="${TRIGGER_SOURCE:-manual}"
+
 setsid nohup bash -lc "
   set +e
   cd '$EC2_PATH'
 
   echo '[INFO] ===== RUN START ====='
   echo '[INFO] RUN_ID=$RUN_ID'
+  echo '[INFO] STOP_ON_FAILURE=$STOP_ON_FAILURE'
+  echo '[INFO] SLOT_CHOICE=$SLOT_CHOICE'
+  echo '[INFO] TIMEZONE_INPUT=$TIMEZONE_INPUT'
+  echo '[INFO] CLEAN_FIRST=$CLEAN_FIRST'
+  echo '[INFO] TRIGGER_SOURCE=$TRIGGER_SOURCE'
   date
 
   echo '[INFO] Updating code...'
@@ -40,13 +51,40 @@ setsid nohup bash -lc "
   sudo systemctl enable docker || true
   sudo systemctl start docker || true
 
-  echo '[INFO] compose down...'
-  $COMPOSE down || true
+  echo '[INFO] Updating .env runtime values...'
+  touch .env
+
+  if grep -q '^SLOT_CHOICE=' .env; then
+    sed -i \"s|^SLOT_CHOICE=.*|SLOT_CHOICE=$SLOT_CHOICE|\" .env
+  else
+    echo 'SLOT_CHOICE=$SLOT_CHOICE' >> .env
+  fi
+
+  if grep -q '^TIMEZONE_INPUT=' .env; then
+    sed -i \"s|^TIMEZONE_INPUT=.*|TIMEZONE_INPUT=$TIMEZONE_INPUT|\" .env
+  else
+    echo 'TIMEZONE_INPUT=$TIMEZONE_INPUT' >> .env
+  fi
+
+  if grep -q '^CLEAN_FIRST=' .env; then
+    sed -i \"s|^CLEAN_FIRST=.*|CLEAN_FIRST=$CLEAN_FIRST|\" .env
+  else
+    echo 'CLEAN_FIRST=$CLEAN_FIRST' >> .env
+  fi
+
+  if grep -q '^TRIGGER_SOURCE=' .env; then
+    sed -i \"s|^TRIGGER_SOURCE=.*|TRIGGER_SOURCE=$TRIGGER_SOURCE|\" .env
+  else
+    echo 'TRIGGER_SOURCE=$TRIGGER_SOURCE' >> .env
+  fi
+
+  echo '[INFO] compose down + docker cleanup before start...'
+  $COMPOSE down --volumes --rmi all --remove-orphans || true
+  docker system prune -a --volumes -f || true
 
   echo '[INFO] compose up (build)...'
   $COMPOSE up -d --build
 
-  # Track pipeline_rest logs (it runs after orchestrator)
   echo '[INFO] following orchestrator logs...'
   docker logs -f orchestrator || true
 
