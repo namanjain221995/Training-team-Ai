@@ -251,18 +251,20 @@ jobs:
               fi
             }
 
-            if [ "$UPDATE_RUNTIME_ENV" = "true" ]; then
-              echo "== workflow_dispatch mode: updating runtime values in server .env =="
-
-              upsert_env "WORKER_ECR_REPO" "${WORKER_ECR_REPO}"
-              upsert_env "WORKER_IMAGE_TAG" "${WORKER_IMAGE_TAG}"
-              upsert_env "SLOT_CHOICE" "${SLOT_CHOICE}"
-              upsert_env "TIMEZONE_INPUT" "${TIMEZONE_INPUT}"
-              upsert_env "CLEAN_FIRST" "${CLEAN_FIRST}"
-              upsert_env "TRIGGER_SOURCE" "${TRIGGER_SOURCE}"
-            else
-              echo "== push mode: keeping existing server .env unchanged =="
-            fi
+            case "$UPDATE_RUNTIME_ENV" in
+              true)
+                echo "== workflow_dispatch mode: updating runtime values in server .env =="
+                upsert_env "WORKER_ECR_REPO" "${WORKER_ECR_REPO}"
+                upsert_env "WORKER_IMAGE_TAG" "${WORKER_IMAGE_TAG}"
+                upsert_env "SLOT_CHOICE" "${SLOT_CHOICE}"
+                upsert_env "TIMEZONE_INPUT" "${TIMEZONE_INPUT}"
+                upsert_env "CLEAN_FIRST" "${CLEAN_FIRST}"
+                upsert_env "TRIGGER_SOURCE" "${TRIGGER_SOURCE}"
+                ;;
+              *)
+                echo "== push mode: keeping existing server .env unchanged =="
+                ;;
+            esac
 
             echo "== Run detached pipeline =="
             echo "STOP_ON_FAILURE=${STOP_ON_FAILURE}"
