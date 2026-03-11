@@ -182,15 +182,7 @@ jobs:
           echo "trigger_source_input=${TRIGGER_SOURCE_INPUT}" >> "$GITHUB_OUTPUT"
           echo "update_runtime_env=${UPDATE_RUNTIME_ENV}" >> "$GITHUB_OUTPUT"
 
-          echo "Resolved inputs:"
-          echo "  raw_slot=${RAW_SLOT}"
-          echo "  slot_choice=${SLOT_CHOICE}"
-          echo "  timezone=${TIMEZONE_INPUT}"
-          echo "  clean_first=${CLEAN_FIRST_INPUT}"
-          echo "  trigger_source=${TRIGGER_SOURCE_INPUT}"
-          echo "  update_runtime_env=${UPDATE_RUNTIME_ENV}"
-
-      - name: Deploy + run pipeline on main EC2 (run_detached.sh)
+      - name: Deploy + run pipeline on main EC2
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
@@ -211,6 +203,26 @@ jobs:
           command_timeout: 60m
           envs: EC2_PATH,WORKER_IMAGE_TAG,WORKER_ECR_REPO,STOP_ON_FAILURE,SLOT_CHOICE,TIMEZONE_INPUT,CLEAN_FIRST,TRIGGER_SOURCE,UPDATE_RUNTIME_ENV
           script: |
+            set -euo pipefail
             cd "$EC2_PATH"
+
+            echo "== Fetch latest code from repo only =="
+            git fetch --all
+            git pull origin main
+
+            echo "== Verify helper exists =="
+            ls -la
+            test -f ci_remote_deploy.sh
+
+            echo "== Run helper =="
             chmod +x ci_remote_deploy.sh
+            STOP_ON_FAILURE="${STOP_ON_FAILURE}" \
+            WORKER_IMAGE_TAG="${WORKER_IMAGE_TAG}" \
+            WORKER_ECR_REPO="${WORKER_ECR_REPO}" \
+            SLOT_CHOICE="${SLOT_CHOICE}" \
+            TIMEZONE_INPUT="${TIMEZONE_INPUT}" \
+            CLEAN_FIRST="${CLEAN_FIRST}" \
+            TRIGGER_SOURCE="${TRIGGER_SOURCE}" \
+            UPDATE_RUNTIME_ENV="${UPDATE_RUNTIME_ENV}" \
+            EC2_PATH="${EC2_PATH}" \
             ./ci_remote_deploy.sh

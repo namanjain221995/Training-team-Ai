@@ -13,10 +13,9 @@ UPDATE_RUNTIME_ENV="${UPDATE_RUNTIME_ENV:-false}"
 
 cd "$EC2_PATH"
 
-echo "== Update code =="
+echo "== Fetch latest code from repo =="
 git fetch --all
-git reset --hard origin/main
-git clean -fd || true
+git pull origin main
 
 echo "== Ensure docker running =="
 sudo systemctl enable docker || true
