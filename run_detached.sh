@@ -23,7 +23,7 @@ echo "$RUN_ID" > "$EC2_PATH/LAST_RUN_ID"
 # If 1 -> stop EC2 even if pipeline_rest fails
 STOP_ON_FAILURE="${STOP_ON_FAILURE:-0}"
 
-# New runtime trigger values
+# Runtime trigger values
 SLOT_CHOICE="${SLOT_CHOICE:-}"
 TIMEZONE_INPUT="${TIMEZONE_INPUT:-America/New_York}"
 CLEAN_FIRST="${CLEAN_FIRST:-false}"
@@ -32,6 +32,16 @@ TRIGGER_SOURCE="${TRIGGER_SOURCE:-manual}"
 setsid nohup bash -lc "
   set +e
   cd '$EC2_PATH'
+
+  upsert_env() {
+    local key=\"\$1\"
+    local value=\"\$2\"
+    if grep -q \"^\${key}=\" .env; then
+      sed -i \"s|^\${key}=.*|\${key}=\${value}|\" .env
+    else
+      echo \"\${key}=\${value}\" >> .env
+    fi
+  }
 
   echo '[INFO] ===== RUN START ====='
   echo '[INFO] RUN_ID=$RUN_ID'
@@ -42,10 +52,9 @@ setsid nohup bash -lc "
   echo '[INFO] TRIGGER_SOURCE=$TRIGGER_SOURCE'
   date
 
-  echo '[INFO] Updating code...'
+  echo '[INFO] Fetch latest code from repo...'
   git fetch --all
-  git reset --hard origin/main
-  git clean -fd || true
+  git pull origin main
 
   echo '[INFO] Ensuring docker running...'
   sudo systemctl enable docker || true
@@ -53,37 +62,37 @@ setsid nohup bash -lc "
 
   echo '[INFO] Updating .env runtime values...'
   touch .env
+  upsert_env 'SLOT_CHOICE' '$SLOT_CHOICE'
+  upsert_env 'TIMEZONE_INPUT' '$TIMEZONE_INPUT'
+  upsert_env 'CLEAN_FIRST' '$CLEAN_FIRST'
+  upsert_env 'TRIGGER_SOURCE' '$TRIGGER_SOURCE'
 
-  if grep -q '^SLOT_CHOICE=' .env; then
-    sed -i \"s|^SLOT_CHOICE=.*|SLOT_CHOICE=$SLOT_CHOICE|\" .env
-  else
-    echo 'SLOT_CHOICE=$SLOT_CHOICE' >> .env
-  fi
-
-  if grep -q '^TIMEZONE_INPUT=' .env; then
-    sed -i \"s|^TIMEZONE_INPUT=.*|TIMEZONE_INPUT=$TIMEZONE_INPUT|\" .env
-  else
-    echo 'TIMEZONE_INPUT=$TIMEZONE_INPUT' >> .env
-  fi
-
-  if grep -q '^CLEAN_FIRST=' .env; then
-    sed -i \"s|^CLEAN_FIRST=.*|CLEAN_FIRST=$CLEAN_FIRST|\" .env
-  else
-    echo 'CLEAN_FIRST=$CLEAN_FIRST' >> .env
-  fi
-
-  if grep -q '^TRIGGER_SOURCE=' .env; then
-    sed -i \"s|^TRIGGER_SOURCE=.*|TRIGGER_SOURCE=$TRIGGER_SOURCE|\" .env
-  else
-    echo 'TRIGGER_SOURCE=$TRIGGER_SOURCE' >> .env
-  fi
-
-  echo '[INFO] compose down + docker cleanup before start...'
+  echo '[INFO] compose down before start...'
   $COMPOSE down --volumes --rmi all --remove-orphans || true
+
+  echo '[INFO] docker cleanup before start...'
   docker system prune -a --volumes -f || true
 
   echo '[INFO] compose up (build)...'
   $COMPOSE up -d --build
+  RC_UP=\$?
+  echo \"[INFO] compose up exit code=\$RC_UP\"
+
+  if [[ \"\$RC_UP\" != \"0\" ]]; then
+    echo \"\$RC_UP\" > '$RUN_DIR/exit_code.txt'
+    date > '$RUN_DIR/DONE'
+    echo '[INFO] compose up failed. Exiting background runner.'
+    exit \$RC_UP
+  fi
+
+  echo '[INFO] compose ps after startup...'
+  $COMPOSE ps || true
+
+  echo '[INFO] waiting 10 seconds for stabilization...'
+  sleep 10
+
+  echo '[INFO] compose ps after stabilization...'
+  $COMPOSE ps || true
 
   echo '[INFO] following orchestrator logs...'
   docker logs -f orchestrator || true

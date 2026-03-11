@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euxo pipefail
+set -euo pipefail
 
 EC2_PATH="${EC2_PATH:-/home/ec2-user/transcription-automation}"
 WORKER_IMAGE_TAG="${WORKER_IMAGE_TAG:-latest}"
@@ -13,17 +13,13 @@ UPDATE_RUNTIME_ENV="${UPDATE_RUNTIME_ENV:-false}"
 
 cd "$EC2_PATH"
 
-echo "== Fetch latest code from repo =="
-git fetch --all
-git pull origin main
+echo "== Pre-clean docker state on server =="
+docker compose down --volumes --rmi all --remove-orphans || true
+docker system prune -a --volumes -f || true
 
 echo "== Ensure docker running =="
 sudo systemctl enable docker || true
 sudo systemctl start docker || true
-
-echo "== Pre-clean docker state on server =="
-docker compose down --volumes --rmi all --remove-orphans || true
-docker system prune -a --volumes -f || true
 
 echo "== Ensure .env exists =="
 touch .env
@@ -38,7 +34,7 @@ upsert_env() {
   fi
 }
 
-if [[ "$UPDATE_RUNTIME_ENV" == "true" ]]; then
+if [ "$UPDATE_RUNTIME_ENV" = "true" ]; then
   echo "== workflow_dispatch mode: updating runtime values in server .env =="
   upsert_env "WORKER_ECR_REPO" "${WORKER_ECR_REPO}"
   upsert_env "WORKER_IMAGE_TAG" "${WORKER_IMAGE_TAG}"
@@ -67,5 +63,3 @@ TRIGGER_SOURCE="${TRIGGER_SOURCE}" \
 UPDATE_RUNTIME_ENV="${UPDATE_RUNTIME_ENV}" \
 EC2_PATH="${EC2_PATH}" \
 ./run_detached.sh
-
-echo "== run_detached.sh started. Pipeline continues in background on EC2. =="

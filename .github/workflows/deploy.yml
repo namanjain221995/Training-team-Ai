@@ -1,4 +1,4 @@
-name: "EC2 Deploy (Docker Compose: Orchestrator -> Pipeline)"
+name: "EC2 Deploy"
 
 on:
   push:
@@ -53,7 +53,7 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & push worker image to ECR
+      - name: Build and push worker image to ECR
         id: ecr
         env:
           AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -72,10 +72,12 @@ jobs:
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
           echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
-          echo "Pushing to: ${IMAGE_URI}"
-
-          aws ecr describe-repositories --region "${AWS_REGION}" --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
-            aws ecr create-repository --region "${AWS_REGION}" --repository-name "${ECR_REPO}" >/dev/null
+          aws ecr describe-repositories \
+            --region "${AWS_REGION}" \
+            --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
+            aws ecr create-repository \
+              --region "${AWS_REGION}" \
+              --repository-name "${ECR_REPO}" >/dev/null
 
           docker build -f Dockerfile.worker -t "${IMAGE_URI}:latest" .
           docker tag "${IMAGE_URI}:latest" "${IMAGE_URI}:${GITHUB_SHA}"
@@ -87,26 +89,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
 
-          STATE="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-            --query 'Reservations[0].Instances[0].State.Name' --output text)"
+          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
+          STATE="$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' \
+            --output text)"
 
           echo "Current state: $STATE"
 
           if [ "$STATE" = "stopping" ]; then
-            echo "Instance is stopping. Waiting for stopped..."
             aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
             STATE="stopped"
           fi
 
           if [ "$STATE" = "pending" ]; then
-            echo "Instance is pending. Waiting for running..."
             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
           elif [ "$STATE" = "running" ]; then
             echo "Instance already running."
           elif [ "$STATE" = "stopped" ]; then
-            echo "Starting instance..."
             aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
             aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
           else
@@ -119,16 +120,18 @@ jobs:
         run: |
           set -euo pipefail
           aws ec2 wait instance-status-ok --instance-ids "${{ secrets.EC2_INSTANCE_ID }}"
-          echo "Instance status checks OK."
 
       - name: Get EC2 public IP
         id: ec2ip
         shell: bash
         run: |
           set -euo pipefail
+
           INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
-          IP="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+          IP="$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)"
 
           if [ "$IP" = "None" ] || [ -z "$IP" ]; then
             echo "ERROR: No public IP on instance."
@@ -136,14 +139,13 @@ jobs:
           fi
 
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
-          echo "EC2 Public IP: $IP"
 
       - name: Wait for SSH
         shell: bash
         run: |
           set -euo pipefail
+
           HOST="${{ steps.ec2ip.outputs.public_ip }}"
-          echo "Waiting for SSH on $HOST:22 ..."
           for i in {1..120}; do
             if nc -z -w 5 "$HOST" 22; then
               echo "SSH reachable."
@@ -151,6 +153,7 @@ jobs:
             fi
             sleep 5
           done
+
           echo "ERROR: SSH not reachable."
           exit 1
 
@@ -182,7 +185,7 @@ jobs:
           echo "trigger_source_input=${TRIGGER_SOURCE_INPUT}" >> "$GITHUB_OUTPUT"
           echo "update_runtime_env=${UPDATE_RUNTIME_ENV}" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy + run pipeline on main EC2
+      - name: Remote deploy and start pipeline
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
@@ -211,11 +214,13 @@ jobs:
             git pull origin main
 
             echo "== Verify helper exists =="
-            ls -la
             test -f ci_remote_deploy.sh
+            test -f run_detached.sh
+            test -f docker-compose.yml
 
-            echo "== Run helper =="
             chmod +x ci_remote_deploy.sh
+            chmod +x run_detached.sh
+
             STOP_ON_FAILURE="${STOP_ON_FAILURE}" \
             WORKER_IMAGE_TAG="${WORKER_IMAGE_TAG}" \
             WORKER_ECR_REPO="${WORKER_ECR_REPO}" \
@@ -226,3 +231,58 @@ jobs:
             UPDATE_RUNTIME_ENV="${UPDATE_RUNTIME_ENV}" \
             EC2_PATH="${EC2_PATH}" \
             ./ci_remote_deploy.sh
+
+      - name: Verify remote startup
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          EC2_PATH: ${{ secrets.EC2_PATH }}
+        with:
+          host: ${{ steps.ec2ip.outputs.public_ip }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: 22
+          script_stop: true
+          command_timeout: 20m
+          envs: EC2_PATH
+          script: |
+            set -euo pipefail
+            cd "$EC2_PATH"
+
+            RUN_ID="$(cat LAST_RUN_ID)"
+            LOG_FILE="$EC2_PATH/runs/$RUN_ID/run.log"
+
+            echo "RUN_ID=$RUN_ID"
+            echo "LOG_FILE=$LOG_FILE"
+
+            for i in {1..24}; do
+              echo "== Startup check $i =="
+              test -f "$LOG_FILE"
+
+              if grep -q "compose up" "$LOG_FILE"; then
+                echo "compose start command found in log."
+              fi
+
+              if docker compose ps --status running | grep -Eq "orchestrator|pipeline_rest|worker_log_viewer"; then
+                echo "Docker compose is running."
+                docker compose ps
+                exit 0
+              fi
+
+              if grep -Eq "Traceback|ERROR|Error response from daemon|No such service|exited with code|failed" "$LOG_FILE"; then
+                echo "Detected startup failure in run log:"
+                tail -n 200 "$LOG_FILE"
+                exit 1
+              fi
+
+              tail -n 50 "$LOG_FILE" || true
+              sleep 10
+            done
+
+            echo "Compose did not become healthy in time."
+            echo "===== docker compose ps ====="
+            docker compose ps || true
+            echo "===== docker ps -a ====="
+            docker ps -a || true
+            echo "===== run log ====="
+            tail -n 200 "$LOG_FILE" || true
+            exit 1
