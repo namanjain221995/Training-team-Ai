@@ -45,7 +45,7 @@ services:
       - WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG:-latest}
 
       # Worker whisper defaults (recommended)
-      - WORKER_WHISPER_MODEL=${WORKER_WHISPER_MODEL:-large-v3}
+      - WORKER_WHISPER_MODEL=${WORKER_WHISPER_MODEL:-medium}
       - WORKER_DEVICE=${WORKER_DEVICE:-cpu}
       - WORKER_COMPUTE_TYPE=${WORKER_COMPUTE_TYPE:-int8}
       - WORKER_LANGUAGE=${WORKER_LANGUAGE:-en}

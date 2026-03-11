@@ -47,8 +47,9 @@ FOLDER_NAMES_TO_PROCESS = [
     "12. JD Video",
 ]
 
-# Worker limits
-MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "0"))  # 0 = launch all
+# Launch behavior
+MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "0"))  # 0 = no cap on total tasks selected
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "14"))
 LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.25"))
 
 # Wait behavior
@@ -57,7 +58,7 @@ WAIT_POLL_SECONDS = int(os.getenv("WAIT_POLL_SECONDS", "15"))
 # Unique RunId tag for this run
 RUN_ID = os.getenv("RUN_ID", "") or time.strftime("%Y%m%d_%H%M%S")
 
-# Drive flakiness (500 Internal Error) -> retries
+# Drive flakiness -> retries
 GOOGLE_EXECUTE_RETRIES = int(os.getenv("GOOGLE_EXECUTE_RETRIES", "8"))
 GOOGLE_PAGE_SIZE = int(os.getenv("GOOGLE_PAGE_SIZE", "500"))
 
@@ -73,7 +74,7 @@ WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
 WORKER_ECR_REPO = os.getenv("WORKER_ECR_REPO", "transcription-worker").strip()
 WORKER_IMAGE_TAG = os.getenv("WORKER_IMAGE_TAG", "latest").strip()
 
-# Worker whisper defaults (stable for CPU instances)
+# Worker whisper defaults
 WORKER_WHISPER_MODEL = os.getenv("WORKER_WHISPER_MODEL", "Large").strip()
 WORKER_DEVICE = os.getenv("WORKER_DEVICE", "cpu").strip()
 WORKER_COMPUTE_TYPE = os.getenv("WORKER_COMPUTE_TYPE", "int8").strip()
@@ -82,8 +83,7 @@ WORKER_USE_VAD = os.getenv("WORKER_USE_VAD", "true").strip().lower()
 WORKER_CHUNK_SECONDS = os.getenv("WORKER_CHUNK_SECONDS", "540").strip()
 WORKER_OVERLAP_SECONDS = os.getenv("WORKER_OVERLAP_SECONDS", "2").strip()
 
-# Worker termination model:
-# IMPORTANT: Set Launch Template "Shutdown behavior" = Terminate
+# Worker termination model
 USE_SHUTDOWN_TERMINATE = os.getenv("USE_SHUTDOWN_TERMINATE", "1").strip().lower() in ("1", "true", "yes", "y")
 
 # -----------------------------
@@ -101,6 +101,7 @@ def _list_kwargs():
         return {"supportsAllDrives": True, "includeItemsFromAllDrives": True, "corpora": "allDrives"}
     return {}
 
+
 def build_drive():
     if not TOKEN_FILE.exists():
         raise RuntimeError(f"token.json not found at {TOKEN_FILE}. Mount it into orchestrator container.")
@@ -117,6 +118,7 @@ def build_drive():
             print(f"[AUTH] Token refreshed but could not write refreshed token: {e}")
 
     return build("drive", "v3", credentials=creds)
+
 
 def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed=false"]
@@ -139,11 +141,13 @@ def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None):
         if not token:
             break
 
+
 def drive_find_child(drive, parent_id: str, name: str, mime_type: Optional[str] = None):
     for f in drive_list_children(drive, parent_id, mime_type):
         if f["name"] == name:
             return f
     return None
+
 
 def drive_search_folder_anywhere(drive, folder_name: str) -> List[dict]:
     q = f"name='{folder_name}' and mimeType='{FOLDER_MIME}' and trashed=false"
@@ -164,6 +168,7 @@ def drive_search_folder_anywhere(drive, folder_name: str) -> List[dict]:
             break
     return out
 
+
 def is_video(name: str) -> bool:
     p = Path(name)
     if p.name.startswith("."):
@@ -174,8 +179,10 @@ def is_video(name: str) -> bool:
         return False
     return True
 
+
 def transcript_name(video_name: str) -> str:
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
+
 
 def pick_slot(drive, root_id: str) -> dict:
     slots = sorted(list(drive_list_children(drive, root_id, FOLDER_MIME)), key=lambda x: x["name"].lower())
@@ -189,6 +196,7 @@ def pick_slot(drive, root_id: str) -> dict:
         return slots[idx - 1]
 
     return slots[0]
+
 
 def find_tasks(drive) -> List[Dict]:
     roots = drive_search_folder_anywhere(drive, ROOT_2026_FOLDER_NAME)
@@ -228,6 +236,7 @@ def find_tasks(drive) -> List[Dict]:
 
     return tasks
 
+
 def _sanitize_stream_name(s: str) -> str:
     s = s.replace("/", "_").replace("\\", "_").replace(":", "_")
     s = s.replace("\n", " ").replace("\r", " ")
@@ -237,7 +246,7 @@ def _sanitize_stream_name(s: str) -> str:
     return s or "video"
 
 # -----------------------------
-# WORKER USERDATA (Docker pull + docker run)
+# WORKER USERDATA
 # -----------------------------
 WORKER_USERDATA_TEMPLATE = r"""#!/bin/bash
 set -euo pipefail
@@ -250,7 +259,7 @@ exec > >(tee -a /var/log/worker-userdata.log) 2>&1
 echo "[BOOT] Worker starting..."
 date
 
-# Always shutdown on exit (prevents stuck workers)
+# Always shutdown on exit
 {EXIT_TRAP}
 
 # IMDSv2
@@ -319,6 +328,9 @@ set -e
 echo "[BOOT] Done."
 """
 
+# -----------------------------
+# Worker launch / state helpers
+# -----------------------------
 def launch_one_worker(task: Dict) -> str:
     stream = _sanitize_stream_name(task["video_name"])
     log_stream = f"{RUN_ID}/{stream}"
@@ -375,31 +387,56 @@ def launch_one_worker(task: Dict) -> str:
         except Exception as e:
             msg = str(e)
             if any(x in msg for x in ["RequestLimitExceeded", "Throttling", "Rate exceeded"]):
-                sleep = (2 ** attempt) + random.random()
-                print(f"[WARN] Throttled. Retry in {sleep:.1f}s ...")
-                time.sleep(sleep)
+                sleep_s = (2 ** attempt) + random.random()
+                print(f"[WARN] Throttled. Retry in {sleep_s:.1f}s ...")
+                time.sleep(sleep_s)
                 continue
             raise
 
-def list_active_workers() -> List[str]:
+
+def describe_run_workers() -> List[Dict]:
     resp = ec2.describe_instances(
         Filters=[
             {"Name": "tag:Purpose", "Values": ["test2-docker"]},
             {"Name": "tag:RunId", "Values": [RUN_ID]},
-            {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "shutting-down"]},
+            {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "shutting-down", "stopped"]},
         ]
     )
-    ids: List[str] = []
+
+    workers: List[Dict] = []
     for r in resp.get("Reservations", []):
         for i in r.get("Instances", []):
-            ids.append(i["InstanceId"])
-    return ids
+            workers.append({
+                "instance_id": i["InstanceId"],
+                "state": i["State"]["Name"],
+            })
+    return workers
 
+
+def list_active_workers() -> List[str]:
+    workers = describe_run_workers()
+    active_states = {"pending", "running", "stopping", "shutting-down"}
+    return [w["instance_id"] for w in workers if w["state"] in active_states]
+
+
+def list_finished_workers() -> List[str]:
+    workers = describe_run_workers()
+    return [w["instance_id"] for w in workers if w["state"] == "stopped"]
+
+
+# -----------------------------
+# Main orchestration loop
+# -----------------------------
 def main():
     if not LAUNCH_TEMPLATE_ID:
         raise RuntimeError("WORKER_LAUNCH_TEMPLATE_ID not set in .env (orchestrator container).")
 
+    if MAX_CONCURRENT_WORKERS < 1:
+        raise RuntimeError("MAX_CONCURRENT_WORKERS must be >= 1")
+
     print(f"[RUN] RUN_ID={RUN_ID} SLOT_CHOICE={SLOT_CHOICE or '1(default)'}")
+    print(f"[RUN] MAX_CONCURRENT_WORKERS={MAX_CONCURRENT_WORKERS}")
+
     drive = build_drive()
 
     tasks = find_tasks(drive)
@@ -407,26 +444,50 @@ def main():
 
     if MAX_LAUNCH > 0:
         tasks = tasks[:MAX_LAUNCH]
-        print(f"[INFO] MAX_LAUNCH applied -> launching {len(tasks)} workers")
+        print(f"[INFO] MAX_LAUNCH applied -> total tasks limited to {len(tasks)}")
 
     if not tasks:
         print("[DONE] No pending transcripts. Exiting ✅")
         return
 
-    for idx, task in enumerate(tasks, start=1):
-        iid = launch_one_worker(task)
-        print(f"[LAUNCH] {idx}/{len(tasks)} -> {iid} | {task['person']} | {task['folder']} | {task['video_name']}")
-        time.sleep(LAUNCH_SLEEP_SECONDS)
+    launched = 0
+    total = len(tasks)
+    next_task_idx = 0
 
-    print("[WAIT] Waiting for workers to finish...")
     while True:
         active = list_active_workers()
-        print(f"[WAIT] active workers: {len(active)}")
-        if not active:
+        active_count = len(active)
+
+        # Fill available slots up to MAX_CONCURRENT_WORKERS
+        while next_task_idx < total and active_count < MAX_CONCURRENT_WORKERS:
+            task = tasks[next_task_idx]
+            iid = launch_one_worker(task)
+            launched += 1
+            next_task_idx += 1
+            active_count += 1
+
+            print(
+                f"[LAUNCH] {launched}/{total} -> {iid} | "
+                f"{task['person']} | {task['folder']} | {task['video_name']}"
+            )
+            time.sleep(LAUNCH_SLEEP_SECONDS)
+
+        # Exit only when all tasks launched and no active workers remain
+        active = list_active_workers()
+        active_count = len(active)
+
+        print(
+            f"[WAIT] launched={launched}/{total} | "
+            f"next_task_idx={next_task_idx} | active_workers={active_count}"
+        )
+
+        if next_task_idx >= total and active_count == 0:
             break
+
         time.sleep(WAIT_POLL_SECONDS)
 
     print("[DONE] All workers completed ✅ (orchestrator exiting)")
+
 
 if __name__ == "__main__":
     main()
