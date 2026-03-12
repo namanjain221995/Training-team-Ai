@@ -1,4 +1,4 @@
-name: "EC2 Deploy"
+name: "🚀 EC2 Deploy"
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       slot:
-        description: "Slot name or slot number (example: 2 or slot 2)"
+        description: "Slot name or number (e.g. 2 or slot 2)"
         required: false
         default: ""
         type: string
@@ -35,25 +35,36 @@ concurrency:
   group: ec2-deploy-main
   cancel-in-progress: true
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PIPELINE JOBS
+# ─────────────────────────────────────────────────────────────────────────────
 jobs:
-  deploy:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 1 ── Build & Push Docker Image to ECR
+  # ──────────────────────────────────────────────────────────────────────────
+  build:
+    name: "🐳 Build & Push to ECR"
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
+    outputs:
+      image_uri: ${{ steps.ecr.outputs.image_uri }}
+      image_tag: ${{ steps.ecr.outputs.tag }}
 
     steps:
-      - name: Checkout repo
+      - name: "📥 Checkout repository"
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
+      - name: "🔐 Configure AWS credentials (OIDC)"
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Amazon ECR
+      - name: "🔑 Login to Amazon ECR"
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push worker image to ECR
+      - name: "🏗️ Build & push worker image"
         id: ecr
         env:
           AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -62,7 +73,7 @@ jobs:
           set -euo pipefail
 
           if [ -z "${ECR_REPO}" ]; then
-            echo "ERROR: WORKER_ECR_REPO secret is empty"
+            echo "::error::WORKER_ECR_REPO secret is empty"
             exit 1
           fi
 
@@ -70,23 +81,50 @@ jobs:
           IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
 
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
-          echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA}"      >> "$GITHUB_OUTPUT"
 
+          echo "::notice::🐳 Building image → ${IMAGE_URI}:${GITHUB_SHA}"
+
+          # Ensure ECR repo exists
           aws ecr describe-repositories \
             --region "${AWS_REGION}" \
             --repository-names "${ECR_REPO}" >/dev/null 2>&1 || \
-            aws ecr create-repository \
-              --region "${AWS_REGION}" \
-              --repository-name "${ECR_REPO}" >/dev/null
+          aws ecr create-repository \
+            --region "${AWS_REGION}" \
+            --repository-name "${ECR_REPO}" >/dev/null
 
-          docker build -f Dockerfile.worker -t "${IMAGE_URI}:latest" .
-          docker tag "${IMAGE_URI}:latest" "${IMAGE_URI}:${GITHUB_SHA}"
+          docker build \
+            --label "git.sha=${GITHUB_SHA}" \
+            --label "git.ref=${GITHUB_REF_NAME}" \
+            --label "build.run=${GITHUB_RUN_ID}" \
+            -f Dockerfile.worker \
+            -t "${IMAGE_URI}:latest" \
+            -t "${IMAGE_URI}:${GITHUB_SHA}" .
 
           docker push "${IMAGE_URI}:latest"
           docker push "${IMAGE_URI}:${GITHUB_SHA}"
 
-      - name: Ensure main EC2 is running
-        shell: bash
+          echo "::notice::✅ Image pushed → ${IMAGE_URI}:${GITHUB_SHA}"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 2 ── Provision & Verify EC2
+  # ──────────────────────────────────────────────────────────────────────────
+  provision:
+    name: "⚡ Provision EC2"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build
+    outputs:
+      public_ip: ${{ steps.ec2ip.outputs.public_ip }}
+
+    steps:
+      - name: "🔐 Configure AWS credentials (OIDC)"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: "🖥️ Ensure EC2 instance is running"
         run: |
           set -euo pipefail
 
@@ -96,70 +134,90 @@ jobs:
             --query 'Reservations[0].Instances[0].State.Name' \
             --output text)"
 
-          echo "Current state: $STATE"
+          echo "Current EC2 state: $STATE"
 
-          if [ "$STATE" = "stopping" ]; then
-            aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
-            STATE="stopped"
-          fi
+          case "$STATE" in
+            stopping)
+              echo "⏳ Waiting for instance to stop..."
+              aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+              ;&
+            stopped)
+              echo "▶️  Starting instance..."
+              aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
+              aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+              ;;
+            pending)
+              echo "⏳ Instance is pending — waiting..."
+              aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+              ;;
+            running)
+              echo "✅ Instance already running."
+              ;;
+            *)
+              echo "::error::Unexpected EC2 state: $STATE"
+              exit 1
+              ;;
+          esac
 
-          if [ "$STATE" = "pending" ]; then
-            aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-          elif [ "$STATE" = "running" ]; then
-            echo "Instance already running."
-          elif [ "$STATE" = "stopped" ]; then
-            aws ec2 start-instances --instance-ids "$INSTANCE_ID" >/dev/null
-            aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-          else
-            echo "ERROR: Unexpected instance state: $STATE"
-            exit 1
-          fi
-
-      - name: Wait for EC2 status checks OK
-        shell: bash
+      - name: "🩺 Wait for EC2 status checks (2/2 OK)"
         run: |
           set -euo pipefail
+          echo "⏳ Waiting for both system & instance status checks..."
           aws ec2 wait instance-status-ok --instance-ids "${{ secrets.EC2_INSTANCE_ID }}"
+          echo "✅ EC2 status checks passed."
 
-      - name: Get EC2 public IP
+      - name: "🌐 Resolve EC2 public IP"
         id: ec2ip
-        shell: bash
         run: |
           set -euo pipefail
 
-          INSTANCE_ID="${{ secrets.EC2_INSTANCE_ID }}"
           IP="$(aws ec2 describe-instances \
-            --instance-ids "$INSTANCE_ID" \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --query 'Reservations[0].Instances[0].PublicIpAddress' \
             --output text)"
 
           if [ "$IP" = "None" ] || [ -z "$IP" ]; then
-            echo "ERROR: No public IP on instance."
+            echo "::error::No public IP found on EC2 instance."
             exit 1
           fi
 
           echo "public_ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "::notice::🌐 EC2 IP resolved → $IP"
 
-      - name: Wait for SSH
-        shell: bash
+      - name: "🔌 Wait for SSH to become reachable"
         run: |
           set -euo pipefail
 
           HOST="${{ steps.ec2ip.outputs.public_ip }}"
-          for i in {1..120}; do
-            if nc -z -w 5 "$HOST" 22; then
-              echo "SSH reachable."
+          echo "⏳ Polling SSH on $HOST:22 ..."
+
+          for i in {1..60}; do
+            if nc -z -w 5 "$HOST" 22 2>/dev/null; then
+              echo "✅ SSH is reachable (attempt $i)."
               exit 0
             fi
+            echo "  → attempt $i/60 — retrying in 5s..."
             sleep 5
           done
 
-          echo "ERROR: SSH not reachable."
+          echo "::error::SSH was not reachable after 5 minutes."
           exit 1
 
-      - name: Resolve workflow inputs
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 3 ── Remote Deploy
+  # ──────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: "🚢 Remote Deploy"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [build, provision]
+
+    steps:
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "🔧 Resolve workflow inputs"
         id: wfinputs
-        shell: bash
         run: |
           set -euo pipefail
 
@@ -179,48 +237,54 @@ jobs:
 
           SLOT_CHOICE="$(printf '%s' "$RAW_SLOT" | grep -oE '[0-9]+' | head -n1 || true)"
 
-          echo "slot_choice=${SLOT_CHOICE}" >> "$GITHUB_OUTPUT"
-          echo "timezone_input=${TIMEZONE_INPUT}" >> "$GITHUB_OUTPUT"
+          echo "slot_choice=${SLOT_CHOICE}"             >> "$GITHUB_OUTPUT"
+          echo "timezone_input=${TIMEZONE_INPUT}"       >> "$GITHUB_OUTPUT"
           echo "clean_first_input=${CLEAN_FIRST_INPUT}" >> "$GITHUB_OUTPUT"
           echo "trigger_source_input=${TRIGGER_SOURCE_INPUT}" >> "$GITHUB_OUTPUT"
           echo "update_runtime_env=${UPDATE_RUNTIME_ENV}" >> "$GITHUB_OUTPUT"
 
-      - name: Remote deploy and start pipeline
+          echo "::notice::🔧 Slot=${SLOT_CHOICE} | TZ=${TIMEZONE_INPUT} | Clean=${CLEAN_FIRST_INPUT}"
+
+      - name: "🚀 Remote deploy & start pipeline"
         uses: appleboy/ssh-action@v1.0.3
         env:
-          EC2_PATH: ${{ secrets.EC2_PATH }}
-          WORKER_IMAGE_TAG: ${{ steps.ecr.outputs.tag }}
-          WORKER_ECR_REPO: ${{ secrets.WORKER_ECR_REPO }}
-          STOP_ON_FAILURE: "1"
-          SLOT_CHOICE: ${{ steps.wfinputs.outputs.slot_choice }}
-          TIMEZONE_INPUT: ${{ steps.wfinputs.outputs.timezone_input }}
-          CLEAN_FIRST: ${{ steps.wfinputs.outputs.clean_first_input }}
-          TRIGGER_SOURCE: ${{ steps.wfinputs.outputs.trigger_source_input }}
+          EC2_PATH:          ${{ secrets.EC2_PATH }}
+          WORKER_IMAGE_TAG:  ${{ needs.build.outputs.image_tag }}
+          WORKER_ECR_REPO:   ${{ secrets.WORKER_ECR_REPO }}
+          STOP_ON_FAILURE:   "1"
+          SLOT_CHOICE:       ${{ steps.wfinputs.outputs.slot_choice }}
+          TIMEZONE_INPUT:    ${{ steps.wfinputs.outputs.timezone_input }}
+          CLEAN_FIRST:       ${{ steps.wfinputs.outputs.clean_first_input }}
+          TRIGGER_SOURCE:    ${{ steps.wfinputs.outputs.trigger_source_input }}
           UPDATE_RUNTIME_ENV: ${{ steps.wfinputs.outputs.update_runtime_env }}
         with:
-          host: ${{ steps.ec2ip.outputs.public_ip }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          port: 22
-          script_stop: true
-          command_timeout: 60m
+          host:            ${{ needs.provision.outputs.public_ip }}
+          username:        ${{ secrets.EC2_USER }}
+          key:             ${{ secrets.EC2_SSH_KEY }}
+          port:            22
+          script_stop:     true
+          command_timeout: 20m
           envs: EC2_PATH,WORKER_IMAGE_TAG,WORKER_ECR_REPO,STOP_ON_FAILURE,SLOT_CHOICE,TIMEZONE_INPUT,CLEAN_FIRST,TRIGGER_SOURCE,UPDATE_RUNTIME_ENV
           script: |
             set -euo pipefail
             cd "$EC2_PATH"
 
-            echo "== Fetch latest code from repo only =="
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🚀  Remote Deploy  |  SHA: ${WORKER_IMAGE_TAG:0:8}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            echo "📦 Pulling latest code..."
             git fetch --all
             git pull origin main
 
-            echo "== Verify helper exists =="
-            test -f ci_remote_deploy.sh
-            test -f run_detached.sh
-            test -f docker-compose.yml
+            echo "🔍 Verifying required helper scripts..."
+            for f in ci_remote_deploy.sh run_detached.sh docker-compose.yml; do
+              test -f "$f" || { echo "ERROR: Missing $f"; exit 1; }
+            done
 
-            chmod +x ci_remote_deploy.sh
-            chmod +x run_detached.sh
+            chmod +x ci_remote_deploy.sh run_detached.sh
 
+            echo "▶️  Executing ci_remote_deploy.sh..."
             STOP_ON_FAILURE="${STOP_ON_FAILURE}" \
             WORKER_IMAGE_TAG="${WORKER_IMAGE_TAG}" \
             WORKER_ECR_REPO="${WORKER_ECR_REPO}" \
@@ -232,57 +296,186 @@ jobs:
             EC2_PATH="${EC2_PATH}" \
             ./ci_remote_deploy.sh
 
-      - name: Verify remote startup
+            echo "✅ ci_remote_deploy.sh completed."
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 4 ── Health Check (Live Log Tail until Compose is healthy)
+  # ──────────────────────────────────────────────────────────────────────────
+  healthcheck:
+    name: "🩺 Startup Health Check"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [provision, deploy]
+
+    steps:
+      - name: "🩺 Verify compose is healthy (live log tail)"
         uses: appleboy/ssh-action@v1.0.3
         env:
           EC2_PATH: ${{ secrets.EC2_PATH }}
         with:
-          host: ${{ steps.ec2ip.outputs.public_ip }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          port: 22
-          script_stop: true
-          command_timeout: 20m
+          host:            ${{ needs.provision.outputs.public_ip }}
+          username:        ${{ secrets.EC2_USER }}
+          key:             ${{ secrets.EC2_SSH_KEY }}
+          port:            22
+          script_stop:     true
+          # ─── INCREASED TIMEOUT: keeps GA alive until healthy ────────────
+          command_timeout: 25m
           envs: EC2_PATH
           script: |
             set -euo pipefail
             cd "$EC2_PATH"
 
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🩺  Health Check — waiting for compose stack"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            # ── read RUN_ID written by ci_remote_deploy.sh ───────────────
+            MAX_WAIT_RUN_ID=60
+            for i in $(seq 1 $MAX_WAIT_RUN_ID); do
+              [ -f LAST_RUN_ID ] && break
+              echo "  ⏳ Waiting for LAST_RUN_ID... ($i/$MAX_WAIT_RUN_ID)"
+              sleep 5
+            done
+
+            if [ ! -f LAST_RUN_ID ]; then
+              echo "::error::LAST_RUN_ID never appeared after ${MAX_WAIT_RUN_ID} attempts."
+              exit 1
+            fi
+
             RUN_ID="$(cat LAST_RUN_ID)"
             LOG_FILE="$EC2_PATH/runs/$RUN_ID/run.log"
+            echo "📋 RUN_ID   = $RUN_ID"
+            echo "📄 LOG_FILE = $LOG_FILE"
 
-            echo "RUN_ID=$RUN_ID"
-            echo "LOG_FILE=$LOG_FILE"
+            # ── wait for log file itself ──────────────────────────────────
+            for i in {1..30}; do
+              [ -f "$LOG_FILE" ] && break
+              echo "  ⏳ Waiting for log file... ($i/30)"
+              sleep 5
+            done
 
-            for i in {1..24}; do
-              echo "== Startup check $i =="
-              test -f "$LOG_FILE"
+            [ -f "$LOG_FILE" ] || { echo "::error::Log file never appeared."; exit 1; }
 
-              if grep -q "compose up" "$LOG_FILE"; then
-                echo "compose start command found in log."
+            # ── HEALTHY SERVICES we require ───────────────────────────────
+            REQUIRED_SERVICES="orchestrator|pipeline_rest|worker_log_viewer"
+
+            # ── Live tail + health polling loop ───────────────────────────
+            #    Runs up to 25 minutes (150 × 10s)
+            LAST_LINE=0
+            for i in {1..150}; do
+              echo ""
+              echo "┌─ Health poll $i/150 ────────────────────────────────"
+
+              # Stream new log lines since last check
+              TOTAL_LINES="$(wc -l < "$LOG_FILE")"
+              if [ "$TOTAL_LINES" -gt "$LAST_LINE" ]; then
+                echo "│ 📄 New log output:"
+                tail -n +"$((LAST_LINE + 1))" "$LOG_FILE" | head -n 60 | sed 's/^/│   /'
+                LAST_LINE="$TOTAL_LINES"
               fi
 
-              if docker compose ps --status running | grep -Eq "orchestrator|pipeline_rest|worker_log_viewer"; then
-                echo "Docker compose is running."
+              # ── Check healthy ─────────────────────────────────────────
+              if docker compose ps --status running 2>/dev/null | grep -Eq "$REQUIRED_SERVICES"; then
+                echo "│"
+                echo "│ ✅ All required services are RUNNING!"
+                echo "└────────────────────────────────────────────────────"
+                echo ""
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "🎉  Stack is healthy — deploy succeeded!"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 docker compose ps
                 exit 0
               fi
 
-              if grep -Eq "Traceback|ERROR|Error response from daemon|No such service|exited with code|failed" "$LOG_FILE"; then
-                echo "Detected startup failure in run log:"
-                tail -n 200 "$LOG_FILE"
+              # ── Detect fatal errors in log ────────────────────────────
+              if grep -Eq \
+                "Traceback|ERROR|Error response from daemon|No such service|exited with code [^0]|failed" \
+                "$LOG_FILE" 2>/dev/null; then
+                echo "│"
+                echo "│ ❌ Detected fatal error in run log:"
+                echo "└────────────────────────────────────────────────────"
+                echo ""
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "💥 STARTUP FAILURE DETECTED"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                echo "=== Last 200 lines of run.log ==="
+                tail -n 200 "$LOG_FILE" || true
+                echo ""
+                echo "=== docker compose ps ==="
+                docker compose ps || true
+                echo ""
+                echo "=== docker ps -a ==="
+                docker ps -a || true
                 exit 1
               fi
 
-              tail -n 50 "$LOG_FILE" || true
+              echo "└─ services not yet ready — sleeping 10s..."
               sleep 10
             done
 
-            echo "Compose did not become healthy in time."
-            echo "===== docker compose ps ====="
+            # ── Timeout ───────────────────────────────────────────────────
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "⏰ TIMEOUT: compose did not become healthy in 25 min"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "=== docker compose ps ==="
             docker compose ps || true
-            echo "===== docker ps -a ====="
+            echo "=== docker ps -a ==="
             docker ps -a || true
-            echo "===== run log ====="
+            echo "=== Last 200 lines of run.log ==="
             tail -n 200 "$LOG_FILE" || true
             exit 1
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 5 ── Notify (always runs — success or failure)
+  # ──────────────────────────────────────────────────────────────────────────
+  notify:
+    name: "📣 Notify"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [build, provision, deploy, healthcheck]
+    if: always()
+
+    steps:
+      - name: "📊 Summarize pipeline result"
+        run: |
+          BUILD_STATUS="${{ needs.build.result }}"
+          PROVISION_STATUS="${{ needs.provision.result }}"
+          DEPLOY_STATUS="${{ needs.deploy.result }}"
+          HEALTH_STATUS="${{ needs.healthcheck.result }}"
+
+          echo "## 🚀 EC2 Deploy Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stage | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
+
+          status_emoji() {
+            case "$1" in
+              success)   echo "✅ success" ;;
+              failure)   echo "❌ failure" ;;
+              cancelled) echo "🚫 cancelled" ;;
+              skipped)   echo "⏭️ skipped" ;;
+              *)         echo "❓ $1" ;;
+            esac
+          }
+
+          echo "| 🐳 Build & Push to ECR     | $(status_emoji $BUILD_STATUS) |"     >> "$GITHUB_STEP_SUMMARY"
+          echo "| ⚡ Provision EC2            | $(status_emoji $PROVISION_STATUS) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🚢 Remote Deploy            | $(status_emoji $DEPLOY_STATUS) |"    >> "$GITHUB_STEP_SUMMARY"
+          echo "| 🩺 Startup Health Check    | $(status_emoji $HEALTH_STATUS) |"    >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Commit:** \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Triggered by:** \`${{ github.actor }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          # Exit with failure if any required job failed
+          for s in "$BUILD_STATUS" "$PROVISION_STATUS" "$DEPLOY_STATUS" "$HEALTH_STATUS"; do
+            if [ "$s" = "failure" ]; then
+              echo ""
+              echo "::error::One or more pipeline stages failed."
+              exit 1
+            fi
+          done
+
+          echo ""
+          echo "✅ All stages passed."

@@ -49,8 +49,8 @@ FOLDER_NAMES_TO_PROCESS = [
 
 # Launch behavior
 MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "0"))  # 0 = no cap on total tasks selected
-MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "14"))
-LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.25"))
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "16"))
+LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.10"))
 
 # Wait behavior
 WAIT_POLL_SECONDS = int(os.getenv("WAIT_POLL_SECONDS", "15"))
@@ -75,7 +75,7 @@ WORKER_ECR_REPO = os.getenv("WORKER_ECR_REPO", "transcription-worker").strip()
 WORKER_IMAGE_TAG = os.getenv("WORKER_IMAGE_TAG", "latest").strip()
 
 # Worker whisper defaults
-WORKER_WHISPER_MODEL = os.getenv("WORKER_WHISPER_MODEL", "Large").strip()
+WORKER_WHISPER_MODEL = os.getenv("WORKER_WHISPER_MODEL", "turbo").strip()
 WORKER_DEVICE = os.getenv("WORKER_DEVICE", "cpu").strip()
 WORKER_COMPUTE_TYPE = os.getenv("WORKER_COMPUTE_TYPE", "int8").strip()
 WORKER_LANGUAGE = os.getenv("WORKER_LANGUAGE", "en").strip()
