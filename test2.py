@@ -8,8 +8,9 @@ import subprocess
 import contextlib
 import wave
 import re
+import json
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 from dotenv import load_dotenv
 
@@ -47,9 +48,9 @@ CHUNK_SECONDS = int((os.getenv("CHUNK_SECONDS") or "540").strip())
 OVERLAP_SECONDS = int((os.getenv("OVERLAP_SECONDS") or "2").strip())
 FORCE_RETRANSCRIBE = (os.getenv("FORCE_RETRANSCRIBE") or "").strip().lower() in ("1", "true", "yes", "y")
 
-# IMPORTANT: default to small for t2.micro safety (can override via env)
+# GPU-friendly defaults
 WHISPER_MODEL = (os.getenv("WHISPER_MODEL") or "large-v3").strip()
-DEVICE = (os.getenv("DEVICE") or "cpu").strip()
+DEVICE = (os.getenv("DEVICE") or "cuda").strip()
 COMPUTE_TYPE = (os.getenv("COMPUTE_TYPE") or ("float16" if DEVICE == "cuda" else "int8")).strip()
 LANGUAGE = (os.getenv("LANGUAGE") or "en").strip()
 USE_VAD = (os.getenv("USE_VAD") or "true").strip().lower() in ("1", "true", "yes", "y")
@@ -57,7 +58,7 @@ USE_VAD = (os.getenv("USE_VAD") or "true").strip().lower() in ("1", "true", "yes
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
-SLOT_CHOICE_ENV = (os.getenv("SLOT_CHOICE") or "4").strip()
+SLOT_CHOICE_ENV = (os.getenv("SLOT_CHOICE") or "").strip()
 
 HEADLESS_AUTH = (os.getenv("HEADLESS_AUTH") or "").strip().lower() in ("1", "true", "yes", "y")
 CREDENTIALS_FILE = Path(os.getenv("CREDENTIALS_FILE") or "credentials.json")
@@ -66,6 +67,8 @@ TOKEN_FILE = Path(os.getenv("TOKEN_FILE") or "token.json")
 VIDEO_FILE_ID = (os.getenv("VIDEO_FILE_ID") or "").strip()
 TARGET_FOLDER_ID = (os.getenv("TARGET_FOLDER_ID") or "").strip()
 VIDEO_NAME_ENV = (os.getenv("VIDEO_NAME") or "").strip()
+
+VIDEO_BATCH_JSON = (os.getenv("VIDEO_BATCH_JSON") or "").strip()
 
 # =========================
 # WINDOWS-SAFE FILENAMES
@@ -123,13 +126,12 @@ def get_drive_service():
             try:
                 TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
                 TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[WARN] Could not persist refreshed token: {e}")
         else:
             if not CREDENTIALS_FILE.exists():
                 raise FileNotFoundError(f"{CREDENTIALS_FILE} not found.")
             if HEADLESS_AUTH:
-                # Workers / CI should never do interactive auth
                 raise RuntimeError(
                     "Drive token is missing/invalid in this environment. "
                     "Update /transcription/worker/token_json in SSM Parameter Store with a valid token.json."
@@ -196,7 +198,7 @@ def drive_get_file_meta(service, file_id: str):
     return execute_with_retries(
         service.files().get(
             fileId=file_id,
-            fields="id,name,mimeType,parents,modifiedTime",
+            fields="id,name,mimeType,parents,modifiedTime,size",
             **_read_kwargs(),
         )
     )
@@ -345,6 +347,7 @@ def fmt_ts(seconds: float) -> str:
 def get_whisper_model():
     from faster_whisper import WhisperModel
     try:
+        print(f"[MODEL] Loading Whisper model={WHISPER_MODEL} device={DEVICE} compute_type={COMPUTE_TYPE}")
         return WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
     except RuntimeError as e:
         if "cuda" in str(e).lower():
@@ -376,6 +379,10 @@ def process_one_video(service, whisper_model, video_file_id: str, target_folder_
     meta = drive_get_file_meta(service, video_file_id)
     video_name = video_name or meta["name"]
     out_txt_name = transcript_output_name(video_name)
+
+    if not is_video_name(video_name):
+        print(f"[SKIP] Not a supported video: {video_name}")
+        return
 
     existing_out = drive_find_child(service, target_folder_id, out_txt_name, None)
     if existing_out and not FORCE_RETRANSCRIBE:
@@ -419,7 +426,39 @@ def process_one_video(service, whisper_model, video_file_id: str, target_folder_
 
         print(f"[UP] uploading transcript -> {out_txt_name}")
         drive_upload_text(service, target_folder_id, out_txt_name, local_txt)
-        print("[OK] done")
+        print(f"[OK] done -> {video_name}")
+
+# =========================
+# PROCESS BATCH
+# =========================
+def process_video_batch(service, whisper_model, batch: List[Dict[str, str]]):
+    total = len(batch)
+    print(f"[BATCH] Starting batch of {total} videos")
+    success = 0
+    failures = 0
+
+    for idx, item in enumerate(batch, start=1):
+        video_file_id = (item.get("video_file_id") or "").strip()
+        target_folder_id = (item.get("target_folder_id") or "").strip()
+        video_name = (item.get("video_name") or "").strip()
+
+        if not video_file_id or not target_folder_id:
+            failures += 1
+            print(f"[ERROR] Invalid batch item #{idx}: missing video_file_id or target_folder_id")
+            continue
+
+        print(f"[BATCH] ({idx}/{total}) Processing: {video_name or video_file_id}")
+        try:
+            process_one_video(service, whisper_model, video_file_id, target_folder_id, video_name)
+            success += 1
+        except Exception as e:
+            failures += 1
+            print(f"[ERROR] Failed processing {video_name or video_file_id}: {e}")
+
+    print(f"[BATCH] Finished. success={success} failures={failures}")
+
+    if failures > 0:
+        raise RuntimeError(f"Batch completed with failures. success={success}, failures={failures}")
 
 # =========================
 # FULL SCAN MODE
@@ -454,7 +493,20 @@ def main_full_scan():
 def main():
     subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-    # Validate single-video env vars
+    if VIDEO_BATCH_JSON:
+        print("[MODE] Batch worker mode")
+        print(f"[INFO] TOKEN_FILE={TOKEN_FILE} exists={TOKEN_FILE.exists()} is_file={TOKEN_FILE.is_file()}")
+        print(f"[INFO] CREDENTIALS_FILE={CREDENTIALS_FILE} exists={CREDENTIALS_FILE.exists()} is_file={CREDENTIALS_FILE.is_file()}")
+
+        batch = json.loads(VIDEO_BATCH_JSON)
+        if not isinstance(batch, list) or not batch:
+            raise RuntimeError("VIDEO_BATCH_JSON must be a non-empty JSON array")
+
+        service = get_drive_service()
+        whisper_model = get_whisper_model()
+        process_video_batch(service, whisper_model, batch)
+        return
+
     if (VIDEO_FILE_ID and not TARGET_FOLDER_ID) or (TARGET_FOLDER_ID and not VIDEO_FILE_ID):
         raise RuntimeError("Both VIDEO_FILE_ID and TARGET_FOLDER_ID must be set for single-video mode.")
 

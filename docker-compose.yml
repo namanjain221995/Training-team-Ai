@@ -16,7 +16,6 @@ services:
 
       - WORKER_LOG_GROUP=/transcription/workers
 
-      # Pipeline trigger/runtime values
       - SLOT_CHOICE=${SLOT_CHOICE}
       - TIMEZONE_INPUT=${TIMEZONE_INPUT:-America/New_York}
       - CLEAN_FIRST=${CLEAN_FIRST:-false}
@@ -28,30 +27,28 @@ services:
       - TOKEN_FILE=/app/token.json
       - TOKEN_FILE_WRITE=/app/state/token_refreshed.json
 
-      # Drive retries
       - GOOGLE_EXECUTE_RETRIES=${GOOGLE_EXECUTE_RETRIES:-8}
       - GOOGLE_PAGE_SIZE=${GOOGLE_PAGE_SIZE:-500}
 
-      # Worker termination behavior
       - USE_SHUTDOWN_TERMINATE=${USE_SHUTDOWN_TERMINATE:-1}
 
-      # SSM params (worker reads)
       - SSM_ENV_PARAM=${SSM_ENV_PARAM:-/transcription/worker/env}
       - SSM_CREDENTIALS_PARAM=${SSM_CREDENTIALS_PARAM:-/transcription/worker/credentials_json}
       - SSM_TOKEN_PARAM=${SSM_TOKEN_PARAM:-/transcription/worker/token_json}
 
-      # ECR worker image (IMPORTANT)
       - WORKER_ECR_REPO=${WORKER_ECR_REPO:-transcription-worker}
       - WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG:-latest}
 
-      # Worker whisper defaults (recommended)
-      - WORKER_WHISPER_MODEL=${WORKER_WHISPER_MODEL:-medium}
-      - WORKER_DEVICE=${WORKER_DEVICE:-cpu}
-      - WORKER_COMPUTE_TYPE=${WORKER_COMPUTE_TYPE:-int8}
+      - WORKER_WHISPER_MODEL=${WORKER_WHISPER_MODEL:-large-v3}
+      - WORKER_DEVICE=${WORKER_DEVICE:-cuda}
+      - WORKER_COMPUTE_TYPE=${WORKER_COMPUTE_TYPE:-float16}
       - WORKER_LANGUAGE=${WORKER_LANGUAGE:-en}
       - WORKER_USE_VAD=${WORKER_USE_VAD:-true}
       - WORKER_CHUNK_SECONDS=${WORKER_CHUNK_SECONDS:-540}
       - WORKER_OVERLAP_SECONDS=${WORKER_OVERLAP_SECONDS:-2}
+
+      - MAX_CONCURRENT_WORKERS=${MAX_CONCURRENT_WORKERS:-2}
+      - VIDEOS_PER_WORKER=${VIDEOS_PER_WORKER:-20}
 
     volumes:
       - ./:/app
@@ -70,7 +67,6 @@ services:
       - AWS_DEFAULT_REGION=${AWS_REGION}
       - AWS_EC2_METADATA_DISABLED=false
 
-      # Pipeline trigger/runtime values
       - SLOT_CHOICE=${SLOT_CHOICE}
       - TIMEZONE_INPUT=${TIMEZONE_INPUT:-America/New_York}
       - CLEAN_FIRST=${CLEAN_FIRST:-false}
@@ -102,13 +98,13 @@ services:
         echo '[INFO] CLEAN_FIRST='\"$$CLEAN_FIRST\";
         echo '[INFO] TRIGGER_SOURCE='\"$$TRIGGER_SOURCE\";
 
-        python script.py || true;
-        python slack_delete.py || true;
-        python llm.py || true;
-        python each-personscore-docs.py || true;
-        python docs.py || true;
-        python sheet.py || true;
-        python final-mail.py || true;
+        python script.py;
+        python slack_delete.py;
+        python llm.py;
+        python each-personscore-docs.py;
+        python docs.py;
+        python sheet.py;
+        python final-mail.py;
       "
 
   log_viewer:
@@ -121,7 +117,6 @@ services:
       - AWS_EC2_METADATA_DISABLED=false
       - WORKER_LOG_GROUP=/transcription/workers
 
-      # Pipeline trigger/runtime values
       - SLOT_CHOICE=${SLOT_CHOICE}
       - TIMEZONE_INPUT=${TIMEZONE_INPUT:-America/New_York}
       - CLEAN_FIRST=${CLEAN_FIRST:-false}

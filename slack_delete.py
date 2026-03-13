@@ -20,8 +20,8 @@ from google.auth.transport.requests import Request
 # =========================
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-CREDENTIALS_FILE = Path(os.environ.get("CREDENTIALS_FILE", "credentials.json"))
-TOKEN_FILE = Path(os.environ.get("TOKEN_FILE", "token.json"))
+CREDENTIALS_FILE = Path("credentials.json")
+TOKEN_FILE = Path("token.json")
 
 ROOT_2026_FOLDER_NAME = os.environ.get("ROOT_2026_FOLDER_NAME", "2026")
 USE_SHARED_DRIVES = os.environ.get("USE_SHARED_DRIVES", "false").strip().lower() in ("1", "true", "yes")
