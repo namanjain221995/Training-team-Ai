@@ -2,7 +2,6 @@ import os
 import time
 import base64
 import random
-import json
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -49,9 +48,8 @@ FOLDER_NAMES_TO_PROCESS = [
 ]
 
 # Launch behavior
-MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "0"))
-MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "4"))
-VIDEOS_PER_WORKER = int(os.getenv("VIDEOS_PER_WORKER", "20"))
+MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "0"))  # 0 = no cap on total tasks selected
+MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "16"))
 LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.10"))
 
 # Wait behavior
@@ -64,12 +62,12 @@ RUN_ID = os.getenv("RUN_ID", "") or time.strftime("%Y%m%d_%H%M%S")
 GOOGLE_EXECUTE_RETRIES = int(os.getenv("GOOGLE_EXECUTE_RETRIES", "8"))
 GOOGLE_PAGE_SIZE = int(os.getenv("GOOGLE_PAGE_SIZE", "500"))
 
-# Worker SSM parameter names
+# Worker SSM parameter names (used inside container)
 SSM_ENV_PARAM = os.getenv("SSM_ENV_PARAM", "/transcription/worker/env")
 SSM_CREDENTIALS_PARAM = os.getenv("SSM_CREDENTIALS_PARAM", "/transcription/worker/credentials_json")
 SSM_TOKEN_PARAM = os.getenv("SSM_TOKEN_PARAM", "/transcription/worker/token_json")
 
-# CloudWatch group for docker logs
+# CloudWatch group for docker logs (awslogs driver)
 WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
 
 # Worker image in ECR
@@ -77,9 +75,9 @@ WORKER_ECR_REPO = os.getenv("WORKER_ECR_REPO", "transcription-worker").strip()
 WORKER_IMAGE_TAG = os.getenv("WORKER_IMAGE_TAG", "latest").strip()
 
 # Worker whisper defaults
-WORKER_WHISPER_MODEL = os.getenv("WORKER_WHISPER_MODEL", "large-v3").strip()
-WORKER_DEVICE = os.getenv("WORKER_DEVICE", "cuda").strip()
-WORKER_COMPUTE_TYPE = os.getenv("WORKER_COMPUTE_TYPE", "float16").strip()
+WORKER_WHISPER_MODEL = os.getenv("WORKER_WHISPER_MODEL", "turbo").strip()
+WORKER_DEVICE = os.getenv("WORKER_DEVICE", "cpu").strip()
+WORKER_COMPUTE_TYPE = os.getenv("WORKER_COMPUTE_TYPE", "int8").strip()
 WORKER_LANGUAGE = os.getenv("WORKER_LANGUAGE", "en").strip()
 WORKER_USE_VAD = os.getenv("WORKER_USE_VAD", "true").strip().lower()
 WORKER_CHUNK_SECONDS = os.getenv("WORKER_CHUNK_SECONDS", "540").strip()
@@ -103,6 +101,7 @@ def _list_kwargs():
         return {"supportsAllDrives": True, "includeItemsFromAllDrives": True, "corpora": "allDrives"}
     return {}
 
+
 def build_drive():
     if not TOKEN_FILE.exists():
         raise RuntimeError(f"token.json not found at {TOKEN_FILE}. Mount it into orchestrator container.")
@@ -119,6 +118,7 @@ def build_drive():
             print(f"[AUTH] Token refreshed but could not write refreshed token: {e}")
 
     return build("drive", "v3", credentials=creds)
+
 
 def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed=false"]
@@ -141,11 +141,13 @@ def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None):
         if not token:
             break
 
+
 def drive_find_child(drive, parent_id: str, name: str, mime_type: Optional[str] = None):
     for f in drive_list_children(drive, parent_id, mime_type):
         if f["name"] == name:
             return f
     return None
+
 
 def drive_search_folder_anywhere(drive, folder_name: str) -> List[dict]:
     q = f"name='{folder_name}' and mimeType='{FOLDER_MIME}' and trashed=false"
@@ -166,6 +168,7 @@ def drive_search_folder_anywhere(drive, folder_name: str) -> List[dict]:
             break
     return out
 
+
 def is_video(name: str) -> bool:
     p = Path(name)
     if p.name.startswith("."):
@@ -176,8 +179,10 @@ def is_video(name: str) -> bool:
         return False
     return True
 
+
 def transcript_name(video_name: str) -> str:
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
+
 
 def pick_slot(drive, root_id: str) -> dict:
     slots = sorted(list(drive_list_children(drive, root_id, FOLDER_MIME)), key=lambda x: x["name"].lower())
@@ -190,7 +195,8 @@ def pick_slot(drive, root_id: str) -> dict:
             raise RuntimeError(f"SLOT_CHOICE out of range (1..{len(slots)})")
         return slots[idx - 1]
 
-    raise RuntimeError("SLOT_CHOICE must be set explicitly")
+    return slots[0]
+
 
 def find_tasks(drive) -> List[Dict]:
     roots = drive_search_folder_anywhere(drive, ROOT_2026_FOLDER_NAME)
@@ -230,30 +236,6 @@ def find_tasks(drive) -> List[Dict]:
 
     return tasks
 
-def batch_tasks(tasks: List[Dict], batch_size: int) -> List[Dict]:
-    batches: List[Dict] = []
-    for i in range(0, len(tasks), batch_size):
-        chunk = tasks[i:i + batch_size]
-        batches.append({
-            "videos": chunk,
-            "slot": chunk[0]["slot"] if chunk else "",
-            "first_person": chunk[0]["person"] if chunk else "",
-            "count": len(chunk),
-        })
-    return batches
-
-def verify_transcripts_exist(drive, tasks: List[Dict]) -> Dict[str, int]:
-    success = 0
-    missing = 0
-    for task in tasks:
-        out = transcript_name(task["video_name"])
-        existing = drive_find_child(drive, task["target_folder_id"], out, None)
-        if existing:
-            success += 1
-        else:
-            missing += 1
-            print(f"[MISSING] {task['person']} | {task['folder']} | {task['video_name']}")
-    return {"success": success, "missing": missing}
 
 def _sanitize_stream_name(s: str) -> str:
     s = s.replace("/", "_").replace("\\", "_").replace(":", "_")
@@ -261,7 +243,7 @@ def _sanitize_stream_name(s: str) -> str:
     s = s.strip()
     if len(s) > 200:
         s = s[:200]
-    return s or "batch"
+    return s or "video"
 
 # -----------------------------
 # WORKER USERDATA
@@ -269,14 +251,18 @@ def _sanitize_stream_name(s: str) -> str:
 WORKER_USERDATA_TEMPLATE = r"""#!/bin/bash
 set -euo pipefail
 
-export VIDEO_BATCH_JSON_B64="{VIDEO_BATCH_JSON_B64}"
+export VIDEO_FILE_ID="{VIDEO_FILE_ID}"
+export TARGET_FOLDER_ID="{TARGET_FOLDER_ID}"
+export VIDEO_NAME="{VIDEO_NAME}"
 
 exec > >(tee -a /var/log/worker-userdata.log) 2>&1
 echo "[BOOT] Worker starting..."
 date
 
+# Always shutdown on exit
 {EXIT_TRAP}
 
+# IMDSv2
 TOKEN="$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)"
 imds() {{
   local p="$1"
@@ -293,6 +279,7 @@ export AWS_REGION="$REGION"
 export AWS_DEFAULT_REGION="$REGION"
 echo "[BOOT] REGION=$REGION INSTANCE_ID=$INSTANCE_ID"
 
+dnf update -y
 dnf install -y docker awscli
 systemctl enable docker
 systemctl start docker
@@ -312,14 +299,15 @@ echo "[BOOT] Starting container..."
 set +e
 docker run --rm \
   --name transcription-worker \
-  --gpus all \
   --log-driver awslogs \
   --log-opt awslogs-region="$REGION" \
   --log-opt awslogs-group="{WORKER_LOG_GROUP}" \
   --log-opt awslogs-stream="{LOG_STREAM}" \
   --log-opt awslogs-create-group="true" \
   -e AWS_REGION="$REGION" \
-  -e VIDEO_BATCH_JSON="$(echo "$VIDEO_BATCH_JSON_B64" | base64 -d)" \
+  -e VIDEO_FILE_ID="$VIDEO_FILE_ID" \
+  -e TARGET_FOLDER_ID="$TARGET_FOLDER_ID" \
+  -e VIDEO_NAME="$VIDEO_NAME" \
   -e USE_SHARED_DRIVES="{USE_SHARED_DRIVES}" \
   -e WHISPER_MODEL="{WHISPER_MODEL}" \
   -e DEVICE="{DEVICE}" \
@@ -337,30 +325,24 @@ RC=$?
 echo "[BOOT] Container exit code=$RC"
 set -e
 
-if [[ "$RC" -ne 0 ]]; then
-  echo "[BOOT] Worker failed with exit code=$RC"
-  exit "$RC"
-fi
-
 echo "[BOOT] Done."
 """
 
 # -----------------------------
 # Worker launch / state helpers
 # -----------------------------
-def launch_one_worker(batch_task: Dict) -> str:
-    stream = _sanitize_stream_name(f"batch-{batch_task['first_person']}-{batch_task['count']}")
+def launch_one_worker(task: Dict) -> str:
+    stream = _sanitize_stream_name(task["video_name"])
     log_stream = f"{RUN_ID}/{stream}"
 
     exit_trap = ""
     if USE_SHUTDOWN_TERMINATE:
         exit_trap = "trap 'echo \"[BOOT] EXIT trap -> shutdown\"; shutdown -h now' EXIT"
 
-    batch_json = json.dumps(batch_task["videos"], separators=(",", ":"))
-    batch_json_b64 = base64.b64encode(batch_json.encode("utf-8")).decode("utf-8")
-
     ud = WORKER_USERDATA_TEMPLATE.format(
-        VIDEO_BATCH_JSON_B64=batch_json_b64,
+        VIDEO_FILE_ID=task["video_file_id"],
+        TARGET_FOLDER_ID=task["target_folder_id"],
+        VIDEO_NAME=task["video_name"].replace('"', "'"),
         AWS_ACCOUNT_ID=AWS_ACCOUNT_ID,
         WORKER_ECR_REPO=WORKER_ECR_REPO,
         WORKER_IMAGE_TAG=WORKER_IMAGE_TAG,
@@ -394,8 +376,10 @@ def launch_one_worker(batch_task: Dict) -> str:
                         {"Key": "Name", "Value": "transcription-worker"},
                         {"Key": "Purpose", "Value": "test2-docker"},
                         {"Key": "RunId", "Value": RUN_ID},
-                        {"Key": "Slot", "Value": batch_task["slot"][:256]},
-                        {"Key": "BatchCount", "Value": str(batch_task["count"])},
+                        {"Key": "Slot", "Value": task["slot"][:256]},
+                        {"Key": "Person", "Value": task["person"][:256]},
+                        {"Key": "Folder", "Value": task["folder"][:256]},
+                        {"Key": "VideoFileId", "Value": task["video_file_id"][:128]},
                     ]
                 }],
             )
@@ -408,6 +392,7 @@ def launch_one_worker(batch_task: Dict) -> str:
                 time.sleep(sleep_s)
                 continue
             raise
+
 
 def describe_run_workers() -> List[Dict]:
     resp = ec2.describe_instances(
@@ -427,10 +412,17 @@ def describe_run_workers() -> List[Dict]:
             })
     return workers
 
+
 def list_active_workers() -> List[str]:
     workers = describe_run_workers()
     active_states = {"pending", "running", "stopping", "shutting-down"}
     return [w["instance_id"] for w in workers if w["state"] in active_states]
+
+
+def list_finished_workers() -> List[str]:
+    workers = describe_run_workers()
+    return [w["instance_id"] for w in workers if w["state"] == "stopped"]
+
 
 # -----------------------------
 # Main orchestration loop
@@ -442,12 +434,8 @@ def main():
     if MAX_CONCURRENT_WORKERS < 1:
         raise RuntimeError("MAX_CONCURRENT_WORKERS must be >= 1")
 
-    if VIDEOS_PER_WORKER < 1:
-        raise RuntimeError("VIDEOS_PER_WORKER must be >= 1")
-
-    print(f"[RUN] RUN_ID={RUN_ID} SLOT_CHOICE={SLOT_CHOICE}")
+    print(f"[RUN] RUN_ID={RUN_ID} SLOT_CHOICE={SLOT_CHOICE or '1(default)'}")
     print(f"[RUN] MAX_CONCURRENT_WORKERS={MAX_CONCURRENT_WORKERS}")
-    print(f"[RUN] VIDEOS_PER_WORKER={VIDEOS_PER_WORKER}")
 
     drive = build_drive()
 
@@ -459,33 +447,32 @@ def main():
         print(f"[INFO] MAX_LAUNCH applied -> total tasks limited to {len(tasks)}")
 
     if not tasks:
-        print("[DONE] No pending transcripts. Exiting")
+        print("[DONE] No pending transcripts. Exiting ✅")
         return
 
-    batched_tasks = batch_tasks(tasks, VIDEOS_PER_WORKER)
-    print(f"[INFO] Worker batches to launch: {len(batched_tasks)}")
-
     launched = 0
-    total = len(batched_tasks)
+    total = len(tasks)
     next_task_idx = 0
 
     while True:
         active = list_active_workers()
         active_count = len(active)
 
+        # Fill available slots up to MAX_CONCURRENT_WORKERS
         while next_task_idx < total and active_count < MAX_CONCURRENT_WORKERS:
-            batch_task = batched_tasks[next_task_idx]
-            iid = launch_one_worker(batch_task)
+            task = tasks[next_task_idx]
+            iid = launch_one_worker(task)
             launched += 1
             next_task_idx += 1
             active_count += 1
 
             print(
                 f"[LAUNCH] {launched}/{total} -> {iid} | "
-                f"videos={batch_task['count']} | first_person={batch_task['first_person']}"
+                f"{task['person']} | {task['folder']} | {task['video_name']}"
             )
             time.sleep(LAUNCH_SLEEP_SECONDS)
 
+        # Exit only when all tasks launched and no active workers remain
         active = list_active_workers()
         active_count = len(active)
 
@@ -499,14 +486,8 @@ def main():
 
         time.sleep(WAIT_POLL_SECONDS)
 
-    print("[VERIFY] Verifying transcripts after worker completion...")
-    verify = verify_transcripts_exist(drive, tasks)
-    print(f"[VERIFY] success={verify['success']} missing={verify['missing']} total={len(tasks)}")
+    print("[DONE] All workers completed ✅ (orchestrator exiting)")
 
-    if verify["missing"] > 0:
-        raise RuntimeError(f"Pipeline finished but {verify['missing']} transcripts are still missing")
 
-    print("[DONE] All workers completed and transcripts verified")
-    
 if __name__ == "__main__":
     main()

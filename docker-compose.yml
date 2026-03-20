@@ -40,14 +40,14 @@ services:
       - WORKER_IMAGE_TAG=${WORKER_IMAGE_TAG:-latest}
 
       - WORKER_WHISPER_MODEL=${WORKER_WHISPER_MODEL:-large-v3}
-      - WORKER_DEVICE=${WORKER_DEVICE:-cuda}
-      - WORKER_COMPUTE_TYPE=${WORKER_COMPUTE_TYPE:-float16}
+      - WORKER_DEVICE=${WORKER_DEVICE:-cpu}
+      - WORKER_COMPUTE_TYPE=${WORKER_COMPUTE_TYPE:-int8}
       - WORKER_LANGUAGE=${WORKER_LANGUAGE:-en}
       - WORKER_USE_VAD=${WORKER_USE_VAD:-true}
       - WORKER_CHUNK_SECONDS=${WORKER_CHUNK_SECONDS:-540}
       - WORKER_OVERLAP_SECONDS=${WORKER_OVERLAP_SECONDS:-2}
 
-      - MAX_CONCURRENT_WORKERS=${MAX_CONCURRENT_WORKERS:-2}
+      - MAX_CONCURRENT_WORKERS=${MAX_CONCURRENT_WORKERS:-14}
       - VIDEOS_PER_WORKER=${VIDEOS_PER_WORKER:-20}
 
     volumes:
@@ -99,7 +99,6 @@ services:
         echo '[INFO] TRIGGER_SOURCE='\"$$TRIGGER_SOURCE\";
 
         python script.py;
-        python slack_delete.py;
         python llm.py;
         python each-personscore-docs.py;
         python docs.py;
