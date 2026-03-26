@@ -98,7 +98,6 @@ services:
         echo '[INFO] CLEAN_FIRST='\"$$CLEAN_FIRST\";
         echo '[INFO] TRIGGER_SOURCE='\"$$TRIGGER_SOURCE\";
 
-        python script.py;
         python llm.py;
         python each-personscore-docs.py;
         python docs.py;
