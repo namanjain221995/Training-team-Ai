@@ -2,14 +2,16 @@ import os
 import time
 import base64
 import random
+import json
+import re
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 import boto3
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+from google.oauth2 import service_account
+from googleapiclient.errors import HttpError
 
 load_dotenv()
 
@@ -21,13 +23,15 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 LAUNCH_TEMPLATE_ID = os.getenv("WORKER_LAUNCH_TEMPLATE_ID", "").strip()
 LAUNCH_TEMPLATE_VERSION = os.getenv("WORKER_LAUNCH_TEMPLATE_VERSION", "$Default")
 
-ROOT_2026_FOLDER_NAME = os.getenv("ROOT_2026_FOLDER_NAME", "2026")
-SLOT_CHOICE = os.getenv("SLOT_CHOICE", "").strip()  # 1-based index
-USE_SHARED_DRIVES = os.getenv("USE_SHARED_DRIVES", "0").strip().lower() in ("1", "true", "yes", "y")
-USE_SHARED_DRIVES_STR = "1" if USE_SHARED_DRIVES else "0"
+ROOT_2026_FOLDER_NAME = os.getenv("ROOT_2026_FOLDER_NAME", "2026").strip()
+ROOT_2026_FOLDER_ID = os.getenv("ROOT_2026_FOLDER_ID", "").strip()
+SHARED_DRIVE_NAME = os.getenv("SHARED_DRIVE_NAME", "").strip()
 
-TOKEN_FILE = Path(os.getenv("TOKEN_FILE", "token.json"))
-TOKEN_FILE_WRITE = Path(os.getenv("TOKEN_FILE_WRITE", "/app/state/token_refreshed.json"))
+SLOT_CHOICE = os.getenv("SLOT_CHOICE", "").strip()  # 1-based index
+
+AUTH_MODE = os.getenv("AUTH_MODE", "service_account").strip().lower()
+USE_DELEGATION = os.getenv("USE_DELEGATION", "1").strip().lower() in ("1", "true", "yes", "y")
+DELEGATED_USER_EMAIL = os.getenv("DELEGATED_USER_EMAIL", "").strip()
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -59,13 +63,13 @@ WAIT_POLL_SECONDS = int(os.getenv("WAIT_POLL_SECONDS", "15"))
 RUN_ID = os.getenv("RUN_ID", "") or time.strftime("%Y%m%d_%H%M%S")
 
 # Drive flakiness -> retries
-GOOGLE_EXECUTE_RETRIES = int(os.getenv("GOOGLE_EXECUTE_RETRIES", "8"))
 GOOGLE_PAGE_SIZE = int(os.getenv("GOOGLE_PAGE_SIZE", "500"))
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_RETRIES = int(os.getenv("GOOGLE_EXECUTE_RETRIES", "8"))
 
-# Worker SSM parameter names (used inside container)
+# Worker SSM parameter names
 SSM_ENV_PARAM = os.getenv("SSM_ENV_PARAM", "/transcription/worker/env")
-SSM_CREDENTIALS_PARAM = os.getenv("SSM_CREDENTIALS_PARAM", "/transcription/worker/credentials_json")
-SSM_TOKEN_PARAM = os.getenv("SSM_TOKEN_PARAM", "/transcription/worker/token_json")
+SSM_SERVICE_ACCOUNT_PARAM = os.getenv("SSM_SERVICE_ACCOUNT_PARAM", "/transcription/worker/service_account_json")
 
 # CloudWatch group for docker logs (awslogs driver)
 WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
@@ -91,83 +95,198 @@ USE_SHUTDOWN_TERMINATE = os.getenv("USE_SHUTDOWN_TERMINATE", "1").strip().lower(
 # -----------------------------
 ec2 = boto3.client("ec2", region_name=AWS_REGION)
 sts = boto3.client("sts", region_name=AWS_REGION)
+ssm = boto3.client("ssm", region_name=AWS_REGION)
 AWS_ACCOUNT_ID = os.getenv("AWS_ACCOUNT_ID", "").strip() or sts.get_caller_identity()["Account"]
+
+# -----------------------------
+# Retry helpers
+# -----------------------------
+def drive_execute(req, label: str = "Drive API call"):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return req.execute()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            if status in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                sleep_s = min(2 ** (attempt - 1), 20) + random.uniform(0, 1)
+                print(f"[RETRY] {label} failed with HTTP {status}. Attempt {attempt}/{MAX_RETRIES}. Sleeping {sleep_s:.1f}s...")
+                time.sleep(sleep_s)
+                continue
+            raise
+        except Exception as e:
+            if attempt < MAX_RETRIES:
+                sleep_s = min(2 ** (attempt - 1), 20) + random.uniform(0, 1)
+                print(f"[RETRY] {label} failed ({e}). Attempt {attempt}/{MAX_RETRIES}. Sleeping {sleep_s:.1f}s...")
+                time.sleep(sleep_s)
+                continue
+            raise
+
+# -----------------------------
+# SSM helpers
+# -----------------------------
+def ssm_get(name: str, with_decryption: bool = True) -> str:
+    resp = ssm.get_parameter(Name=name, WithDecryption=with_decryption)
+    return resp["Parameter"]["Value"]
+
+# -----------------------------
+# Drive auth (service account + delegation)
+# -----------------------------
+def parse_service_account_json(text: str) -> Dict[str, Any]:
+    try:
+        return json.loads(text)
+    except Exception as e:
+        raise RuntimeError(f"Invalid service account JSON from SSM: {e}")
+
+def build_drive(service_account_json_text: str):
+    if AUTH_MODE != "service_account":
+        raise RuntimeError(f"Unsupported AUTH_MODE='{AUTH_MODE}'. Use AUTH_MODE=service_account")
+
+    creds = service_account.Credentials.from_service_account_info(
+        parse_service_account_json(service_account_json_text),
+        scopes=SCOPES,
+    )
+
+    if USE_DELEGATION:
+        if not DELEGATED_USER_EMAIL:
+            raise RuntimeError("USE_DELEGATION=true but DELEGATED_USER_EMAIL is empty.")
+        creds = creds.with_subject(DELEGATED_USER_EMAIL)
+        print(f"[AUTH] Service account with delegation -> {DELEGATED_USER_EMAIL}")
+    else:
+        print("[AUTH] Service account without delegation")
+
+    return build("drive", "v3", credentials=creds)
 
 # -----------------------------
 # Drive helpers
 # -----------------------------
-def _list_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True, "includeItemsFromAllDrives": True, "corpora": "allDrives"}
-    return {}
+def _escape_drive_q_value(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
+def _slot_sort_key(name: str):
+    m = re.search(r"(\d+)", name or "")
+    return (int(m.group(1)) if m else float("inf"), (name or "").lower())
 
-def build_drive():
-    if not TOKEN_FILE.exists():
-        raise RuntimeError(f"token.json not found at {TOKEN_FILE}. Mount it into orchestrator container.")
+def _list_kwargs_for_drive(drive_id: Optional[str] = None) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+    }
+    if drive_id:
+        kwargs["corpora"] = "drive"
+        kwargs["driveId"] = drive_id
+    else:
+        kwargs["corpora"] = "allDrives"
+    return kwargs
 
-    creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+def _get_kwargs() -> Dict[str, Any]:
+    return {"supportsAllDrives": True}
 
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        try:
-            TOKEN_FILE_WRITE.parent.mkdir(parents=True, exist_ok=True)
-            TOKEN_FILE_WRITE.write_text(creds.to_json(), encoding="utf-8")
-            print(f"[AUTH] Token refreshed; wrote updated token to {TOKEN_FILE_WRITE} (original token.json is read-only).")
-        except Exception as e:
-            print(f"[AUTH] Token refreshed but could not write refreshed token: {e}")
-
-    return build("drive", "v3", credentials=creds)
-
-
-def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None):
-    q_parts = [f"'{parent_id}' in parents", "trashed=false"]
-    if mime_type:
-        q_parts.append(f"mimeType='{mime_type}'")
-    q = " and ".join(q_parts)
-
-    token = None
-    while True:
-        req = drive.files().list(
-            q=q,
-            fields="nextPageToken, files(id,name,mimeType,modifiedTime)",
-            pageSize=GOOGLE_PAGE_SIZE,
-            pageToken=token,
-            **_list_kwargs(),
-        )
-        res = req.execute(num_retries=GOOGLE_EXECUTE_RETRIES)
-        yield from res.get("files", [])
-        token = res.get("nextPageToken")
-        if not token:
-            break
-
-
-def drive_find_child(drive, parent_id: str, name: str, mime_type: Optional[str] = None):
-    for f in drive_list_children(drive, parent_id, mime_type):
-        if f["name"] == name:
-            return f
-    return None
-
-
-def drive_search_folder_anywhere(drive, folder_name: str) -> List[dict]:
-    q = f"name='{folder_name}' and mimeType='{FOLDER_MIME}' and trashed=false"
+def list_shared_drives(drive) -> List[dict]:
     out: List[dict] = []
     token = None
     while True:
-        req = drive.files().list(
-            q=q,
-            fields="nextPageToken, files(id,name,parents,modifiedTime)",
-            pageSize=GOOGLE_PAGE_SIZE,
-            pageToken=token,
-            **_list_kwargs(),
+        res = drive_execute(
+            drive.drives().list(pageSize=100, pageToken=token),
+            label="list shared drives",
         )
-        res = req.execute(num_retries=GOOGLE_EXECUTE_RETRIES)
-        out.extend(res.get("files", []))
+        out.extend(res.get("drives", []))
         token = res.get("nextPageToken")
         if not token:
             break
     return out
 
+def get_shared_drive_by_name(drive, drive_name: str) -> dict:
+    drives = list_shared_drives(drive)
+    matches = [d for d in drives if d.get("name") == drive_name]
+
+    if not matches:
+        available = sorted([d.get("name", "") for d in drives])
+        raise RuntimeError(
+            f"Shared Drive '{drive_name}' not found.\n"
+            f"Visible Shared Drives: {available}"
+        )
+
+    if len(matches) > 1:
+        print(f"[WARN] Multiple Shared Drives named '{drive_name}'. Using first match.")
+
+    return matches[0]
+
+def drive_get_file(drive, file_id: str) -> dict:
+    return drive_execute(
+        drive.files().get(
+            fileId=file_id,
+            fields="id,name,parents,modifiedTime,mimeType,driveId",
+            **_get_kwargs(),
+        ),
+        label=f"get file {file_id}",
+    )
+
+def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
+    q_parts = [f"'{parent_id}' in parents", "trashed = false"]
+    if mime_type:
+        q_parts.append(f"mimeType = '{_escape_drive_q_value(mime_type)}'")
+    q = " and ".join(q_parts)
+
+    token = None
+    while True:
+        res = drive_execute(
+            drive.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,mimeType,modifiedTime,size,parents,driveId)",
+                pageSize=GOOGLE_PAGE_SIZE,
+                pageToken=token,
+                **_list_kwargs_for_drive(drive_id),
+            ),
+            label=f"list children of parent {parent_id}",
+        )
+        yield from res.get("files", [])
+        token = res.get("nextPageToken")
+        if not token:
+            break
+
+def drive_find_child(drive, parent_id: str, name: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
+    safe_name = _escape_drive_q_value(name)
+    q_parts = [f"'{parent_id}' in parents", "trashed = false", f"name = '{safe_name}'"]
+    if mime_type:
+        q_parts.append(f"mimeType = '{_escape_drive_q_value(mime_type)}'")
+    q = " and ".join(q_parts)
+
+    res = drive_execute(
+        drive.files().list(
+            q=q,
+            fields="files(id,name,mimeType,modifiedTime,parents,driveId)",
+            pageSize=50,
+            **_list_kwargs_for_drive(drive_id),
+        ),
+        label=f"find child '{name}' in parent {parent_id}",
+    )
+    files = res.get("files", []) or []
+    if not files:
+        return None
+    return sorted(files, key=lambda x: x.get("modifiedTime") or "", reverse=True)[0]
+
+def drive_search_folder_anywhere_in_shared_drive(drive, folder_name: str, drive_id: str) -> List[dict]:
+    safe_name = _escape_drive_q_value(folder_name)
+    q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed = false"
+
+    out: List[dict] = []
+    token = None
+    while True:
+        res = drive_execute(
+            drive.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,parents,modifiedTime,driveId,mimeType)",
+                pageSize=GOOGLE_PAGE_SIZE,
+                pageToken=token,
+                **_list_kwargs_for_drive(drive_id),
+            ),
+            label=f"search folder '{folder_name}' in shared drive {drive_id}",
+        )
+        out.extend(res.get("files", []))
+        token = res.get("nextPageToken")
+        if not token:
+            break
+    return out
 
 def is_video(name: str) -> bool:
     p = Path(name)
@@ -179,13 +298,14 @@ def is_video(name: str) -> bool:
         return False
     return True
 
-
 def transcript_name(video_name: str) -> str:
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
 
-
-def pick_slot(drive, root_id: str) -> dict:
-    slots = sorted(list(drive_list_children(drive, root_id, FOLDER_MIME)), key=lambda x: x["name"].lower())
+def pick_slot(drive, root_id: str, drive_id: str) -> dict:
+    slots = sorted(
+        list(drive_list_children(drive, root_id, FOLDER_MIME, drive_id)),
+        key=lambda x: _slot_sort_key(x.get("name") or ""),
+    )
     if not slots:
         raise RuntimeError("No slot folders found under 2026.")
 
@@ -197,45 +317,67 @@ def pick_slot(drive, root_id: str) -> dict:
 
     return slots[0]
 
+def find_tasks(drive) -> List[Dict[str, str]]:
+    if not SHARED_DRIVE_NAME:
+        raise RuntimeError("SHARED_DRIVE_NAME is required.")
 
-def find_tasks(drive) -> List[Dict]:
-    roots = drive_search_folder_anywhere(drive, ROOT_2026_FOLDER_NAME)
-    if not roots:
-        raise RuntimeError(f"Drive folder '{ROOT_2026_FOLDER_NAME}' not found.")
+    shared_drive = get_shared_drive_by_name(drive, SHARED_DRIVE_NAME)
+    shared_drive_id = shared_drive["id"]
+    print(f"[INFO] Using Shared Drive: {shared_drive['name']} ({shared_drive_id})")
 
-    roots.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
-    root_id = roots[0]["id"]
+    if ROOT_2026_FOLDER_ID:
+        root = drive_get_file(drive, ROOT_2026_FOLDER_ID)
+        if root.get("mimeType") != FOLDER_MIME:
+            raise RuntimeError(f"ROOT_2026_FOLDER_ID={ROOT_2026_FOLDER_ID} is not a folder.")
+        file_drive_id = root.get("driveId")
+        if file_drive_id and file_drive_id != shared_drive_id:
+            raise RuntimeError(
+                f"ROOT_2026_FOLDER_ID belongs to driveId={file_drive_id}, "
+                f"but SHARED_DRIVE_NAME resolved to driveId={shared_drive_id}."
+            )
+    else:
+        roots = drive_search_folder_anywhere_in_shared_drive(drive, ROOT_2026_FOLDER_NAME, shared_drive_id)
+        if not roots:
+            raise RuntimeError(
+                f"Could not find folder '{ROOT_2026_FOLDER_NAME}' inside Shared Drive '{SHARED_DRIVE_NAME}'."
+            )
+        roots.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
+        root = roots[0]
 
-    slot = pick_slot(drive, root_id)
-    people = sorted(list(drive_list_children(drive, slot["id"], FOLDER_MIME)), key=lambda x: x["name"])
+    slot = pick_slot(drive, root["id"], shared_drive_id)
+    people = sorted(
+        list(drive_list_children(drive, slot["id"], FOLDER_MIME, shared_drive_id)),
+        key=lambda x: x["name"].lower(),
+    )
 
-    tasks: List[Dict] = []
+    tasks: List[Dict[str, str]] = []
     for person in people:
         for folder_name in FOLDER_NAMES_TO_PROCESS:
-            folder = drive_find_child(drive, person["id"], folder_name, FOLDER_MIME)
+            folder = drive_find_child(drive, person["id"], folder_name, FOLDER_MIME, shared_drive_id)
             if not folder:
                 continue
             folder_id = folder["id"]
 
-            children = list(drive_list_children(drive, folder_id, None))
+            children = list(drive_list_children(drive, folder_id, None, shared_drive_id))
             videos = [f for f in children if f["mimeType"] != FOLDER_MIME and is_video(f["name"])]
 
             for vid in videos:
                 out = transcript_name(vid["name"])
-                if drive_find_child(drive, folder_id, out, None):
+                if drive_find_child(drive, folder_id, out, None, shared_drive_id):
                     continue
 
-                tasks.append({
-                    "video_file_id": vid["id"],
-                    "target_folder_id": folder_id,
-                    "video_name": vid["name"],
-                    "slot": slot["name"],
-                    "person": person["name"],
-                    "folder": folder_name,
-                })
+                tasks.append(
+                    {
+                        "video_file_id": vid["id"],
+                        "target_folder_id": folder_id,
+                        "video_name": vid["name"],
+                        "slot": slot["name"],
+                        "person": person["name"],
+                        "folder": folder_name,
+                    }
+                )
 
     return tasks
-
 
 def _sanitize_stream_name(s: str) -> str:
     s = s.replace("/", "_").replace("\\", "_").replace(":", "_")
@@ -308,7 +450,12 @@ docker run --rm \
   -e VIDEO_FILE_ID="$VIDEO_FILE_ID" \
   -e TARGET_FOLDER_ID="$TARGET_FOLDER_ID" \
   -e VIDEO_NAME="$VIDEO_NAME" \
-  -e USE_SHARED_DRIVES="{USE_SHARED_DRIVES}" \
+  -e AUTH_MODE="service_account" \
+  -e USE_DELEGATION="{USE_DELEGATION}" \
+  -e DELEGATED_USER_EMAIL="{DELEGATED_USER_EMAIL}" \
+  -e SHARED_DRIVE_NAME="{SHARED_DRIVE_NAME}" \
+  -e ROOT_2026_FOLDER_NAME="{ROOT_2026_FOLDER_NAME}" \
+  -e ROOT_2026_FOLDER_ID="{ROOT_2026_FOLDER_ID}" \
   -e WHISPER_MODEL="{WHISPER_MODEL}" \
   -e DEVICE="{DEVICE}" \
   -e COMPUTE_TYPE="{COMPUTE_TYPE}" \
@@ -317,8 +464,7 @@ docker run --rm \
   -e CHUNK_SECONDS="{CHUNK_SECONDS}" \
   -e OVERLAP_SECONDS="{OVERLAP_SECONDS}" \
   -e SSM_ENV_PARAM="{SSM_ENV_PARAM}" \
-  -e SSM_CREDENTIALS_PARAM="{SSM_CREDENTIALS_PARAM}" \
-  -e SSM_TOKEN_PARAM="{SSM_TOKEN_PARAM}" \
+  -e SSM_SERVICE_ACCOUNT_PARAM="{SSM_SERVICE_ACCOUNT_PARAM}" \
   "$IMAGE_URI" \
   python -u /app/worker_entrypoint.py
 RC=$?
@@ -331,7 +477,7 @@ echo "[BOOT] Done."
 # -----------------------------
 # Worker launch / state helpers
 # -----------------------------
-def launch_one_worker(task: Dict) -> str:
+def launch_one_worker(task: Dict[str, str]) -> str:
     stream = _sanitize_stream_name(task["video_name"])
     log_stream = f"{RUN_ID}/{stream}"
 
@@ -349,7 +495,11 @@ def launch_one_worker(task: Dict) -> str:
         WORKER_LOG_GROUP=WORKER_LOG_GROUP,
         LOG_STREAM=log_stream,
         EXIT_TRAP=exit_trap,
-        USE_SHARED_DRIVES=USE_SHARED_DRIVES_STR,
+        USE_DELEGATION="1" if USE_DELEGATION else "0",
+        DELEGATED_USER_EMAIL=DELEGATED_USER_EMAIL,
+        SHARED_DRIVE_NAME=SHARED_DRIVE_NAME,
+        ROOT_2026_FOLDER_NAME=ROOT_2026_FOLDER_NAME,
+        ROOT_2026_FOLDER_ID=ROOT_2026_FOLDER_ID,
         WHISPER_MODEL=WORKER_WHISPER_MODEL,
         DEVICE=WORKER_DEVICE,
         COMPUTE_TYPE=WORKER_COMPUTE_TYPE,
@@ -358,8 +508,7 @@ def launch_one_worker(task: Dict) -> str:
         CHUNK_SECONDS=WORKER_CHUNK_SECONDS,
         OVERLAP_SECONDS=WORKER_OVERLAP_SECONDS,
         SSM_ENV_PARAM=SSM_ENV_PARAM,
-        SSM_CREDENTIALS_PARAM=SSM_CREDENTIALS_PARAM,
-        SSM_TOKEN_PARAM=SSM_TOKEN_PARAM,
+        SSM_SERVICE_ACCOUNT_PARAM=SSM_SERVICE_ACCOUNT_PARAM,
     )
     ud_b64 = base64.b64encode(ud.encode("utf-8")).decode("utf-8")
 
@@ -370,18 +519,20 @@ def launch_one_worker(task: Dict) -> str:
                 MinCount=1,
                 MaxCount=1,
                 UserData=ud_b64,
-                TagSpecifications=[{
-                    "ResourceType": "instance",
-                    "Tags": [
-                        {"Key": "Name", "Value": "transcription-worker"},
-                        {"Key": "Purpose", "Value": "test2-docker"},
-                        {"Key": "RunId", "Value": RUN_ID},
-                        {"Key": "Slot", "Value": task["slot"][:256]},
-                        {"Key": "Person", "Value": task["person"][:256]},
-                        {"Key": "Folder", "Value": task["folder"][:256]},
-                        {"Key": "VideoFileId", "Value": task["video_file_id"][:128]},
-                    ]
-                }],
+                TagSpecifications=[
+                    {
+                        "ResourceType": "instance",
+                        "Tags": [
+                            {"Key": "Name", "Value": "transcription-worker"},
+                            {"Key": "Purpose", "Value": "test2-docker"},
+                            {"Key": "RunId", "Value": RUN_ID},
+                            {"Key": "Slot", "Value": task["slot"][:256]},
+                            {"Key": "Person", "Value": task["person"][:256]},
+                            {"Key": "Folder", "Value": task["folder"][:256]},
+                            {"Key": "VideoFileId", "Value": task["video_file_id"][:128]},
+                        ],
+                    }
+                ],
             )
             return resp["Instances"][0]["InstanceId"]
         except Exception as e:
@@ -393,8 +544,7 @@ def launch_one_worker(task: Dict) -> str:
                 continue
             raise
 
-
-def describe_run_workers() -> List[Dict]:
+def describe_run_workers() -> List[Dict[str, str]]:
     resp = ec2.describe_instances(
         Filters=[
             {"Name": "tag:Purpose", "Values": ["test2-docker"]},
@@ -403,26 +553,21 @@ def describe_run_workers() -> List[Dict]:
         ]
     )
 
-    workers: List[Dict] = []
+    workers: List[Dict[str, str]] = []
     for r in resp.get("Reservations", []):
         for i in r.get("Instances", []):
-            workers.append({
-                "instance_id": i["InstanceId"],
-                "state": i["State"]["Name"],
-            })
+            workers.append(
+                {
+                    "instance_id": i["InstanceId"],
+                    "state": i["State"]["Name"],
+                }
+            )
     return workers
-
 
 def list_active_workers() -> List[str]:
     workers = describe_run_workers()
     active_states = {"pending", "running", "stopping", "shutting-down"}
     return [w["instance_id"] for w in workers if w["state"] in active_states]
-
-
-def list_finished_workers() -> List[str]:
-    workers = describe_run_workers()
-    return [w["instance_id"] for w in workers if w["state"] == "stopped"]
-
 
 # -----------------------------
 # Main orchestration loop
@@ -430,14 +575,18 @@ def list_finished_workers() -> List[str]:
 def main():
     if not LAUNCH_TEMPLATE_ID:
         raise RuntimeError("WORKER_LAUNCH_TEMPLATE_ID not set in .env (orchestrator container).")
-
+    if not SHARED_DRIVE_NAME:
+        raise RuntimeError("SHARED_DRIVE_NAME not set in .env.")
+    if AUTH_MODE != "service_account":
+        raise RuntimeError("This orchestrator now supports AUTH_MODE=service_account only.")
     if MAX_CONCURRENT_WORKERS < 1:
         raise RuntimeError("MAX_CONCURRENT_WORKERS must be >= 1")
 
     print(f"[RUN] RUN_ID={RUN_ID} SLOT_CHOICE={SLOT_CHOICE or '1(default)'}")
     print(f"[RUN] MAX_CONCURRENT_WORKERS={MAX_CONCURRENT_WORKERS}")
 
-    drive = build_drive()
+    service_account_json_text = ssm_get(SSM_SERVICE_ACCOUNT_PARAM, with_decryption=True)
+    drive = build_drive(service_account_json_text)
 
     tasks = find_tasks(drive)
     print(f"[INFO] Pending videos (missing transcripts): {len(tasks)}")
@@ -458,7 +607,6 @@ def main():
         active = list_active_workers()
         active_count = len(active)
 
-        # Fill available slots up to MAX_CONCURRENT_WORKERS
         while next_task_idx < total and active_count < MAX_CONCURRENT_WORKERS:
             task = tasks[next_task_idx]
             iid = launch_one_worker(task)
@@ -472,7 +620,6 @@ def main():
             )
             time.sleep(LAUNCH_SLEEP_SECONDS)
 
-        # Exit only when all tasks launched and no active workers remain
         active = list_active_workers()
         active_count = len(active)
 
@@ -487,7 +634,6 @@ def main():
         time.sleep(WAIT_POLL_SECONDS)
 
     print("[DONE] All workers completed ✅ (orchestrator exiting)")
-
 
 if __name__ == "__main__":
     main()

@@ -15,11 +15,9 @@ import requests
 from dotenv import load_dotenv
 
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 
 # =========================
 # LOAD ENV (.env)
@@ -29,7 +27,8 @@ load_dotenv()
 # =========================
 # CONFIG
 # =========================
-ROOT_2026_FOLDER_NAME = "2026"  # the folder containing Slot folders (can be nested anywhere in My Drive)
+ROOT_2026_FOLDER_NAME = (os.getenv("ROOT_2026_FOLDER_NAME") or "2026").strip()
+SHARED_DRIVE_NAME = (os.getenv("SHARED_DRIVE_NAME") or "").strip()
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 
@@ -48,26 +47,27 @@ FOLDER_NAMES_TO_PROCESS = [
 
 # OpenAI Transcription
 MODEL = "gpt-4o-transcribe-diarize"
-LANGUAGE = "en"  # set None for auto-detect
+LANGUAGE = "en"
 FORCE_RETRANSCRIBE = False
-INCLUDE_SPEAKER = False  # True => "m:ss: Speaker X: text"
+INCLUDE_SPEAKER = False
 CHUNKING_STRATEGY = "auto"
-CHUNK_SECONDS = 540  # 9 minutes
+CHUNK_SECONDS = 540
 OVERLAP_SECONDS = 2
 API_URL = "https://api.openai.com/v1/audio/transcriptions"
 
-# Transcript output naming
-# Video: Foo.mp4  -> Foo_transcripts.txt
 TRANSCRIPT_SUFFIX = "_transcripts.txt"
 
-# Google Drive OAuth
+# Google Drive Auth - Service Account
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-CREDENTIALS_FILE = Path("credentials.json")
-TOKEN_FILE = Path("token.json")
-FOLDER_MIME = "application/vnd.google-apps.folder"
+SERVICE_ACCOUNT_FILE = Path((os.getenv("SERVICE_ACCOUNT_FILE") or "service-account.json").strip())
+AUTH_MODE = (os.getenv("AUTH_MODE") or "service_account").strip().lower()
+USE_DELEGATION = (os.getenv("USE_DELEGATION") or "").strip().lower() in ("1", "true", "yes", "y")
+DELEGATED_USER_EMAIL = (os.getenv("DELEGATED_USER_EMAIL") or "").strip()
 
-USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
+USE_SHARED_DRIVES = True  # forced true because this script is Shared-Drive-only
 SLOT_CHOICE_ENV = (os.getenv("SLOT_CHOICE") or "").strip()
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
 
 # =========================
 # AUTH: OpenAI
@@ -86,6 +86,7 @@ _WINDOWS_RESERVED = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 
+
 def safe_local_filename(name: str, fallback: str = "file.bin") -> str:
     name = (name or "").strip() or fallback
     name = re.sub(f"[{re.escape(_WINDOWS_FORBIDDEN)}]", "_", name)
@@ -97,17 +98,15 @@ def safe_local_filename(name: str, fallback: str = "file.bin") -> str:
     name = stem + (dot + ext if dot else "")
     return name or fallback
 
+
 def transcript_output_name(video_name: str) -> str:
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
+
 
 # =========================
 # RETRY WRAPPER (Drive API)
 # =========================
 def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1.0):
-    """
-    Retries transient Google API errors: 429, 500, 502, 503, 504.
-    Exponential backoff + jitter.
-    """
     for attempt in range(max_retries):
         try:
             return request.execute()
@@ -122,52 +121,106 @@ def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1
                 continue
             raise
 
+
 # =========================
-# Google Drive Auth
+# Google Drive Auth (Service Account)
 # =========================
 def get_drive_service():
-    creds = None
-    if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    if AUTH_MODE != "service_account":
+        raise RuntimeError(f"Unsupported AUTH_MODE='{AUTH_MODE}'. Use AUTH_MODE=service_account")
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not CREDENTIALS_FILE.exists():
-                raise FileNotFoundError("credentials.json not found next to this script.")
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            # NOTE: In Docker/headless, consider changing to: flow.run_console()
-            creds = flow.run_local_server(port=0)
+    if not SERVICE_ACCOUNT_FILE.exists():
+        raise FileNotFoundError(
+            f"Service account file not found: {SERVICE_ACCOUNT_FILE}\n"
+            f"Set SERVICE_ACCOUNT_FILE in .env or keep service-account.json beside script."
+        )
 
-        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+    creds = service_account.Credentials.from_service_account_file(
+        str(SERVICE_ACCOUNT_FILE),
+        scopes=SCOPES,
+    )
+
+    if USE_DELEGATION:
+        if not DELEGATED_USER_EMAIL:
+            raise RuntimeError("USE_DELEGATION=true but DELEGATED_USER_EMAIL is empty.")
+        creds = creds.with_subject(DELEGATED_USER_EMAIL)
+        print(f"[AUTH] Service account with delegation -> {DELEGATED_USER_EMAIL}")
+    else:
+        print("[AUTH] Service account without delegation")
 
     return build("drive", "v3", credentials=creds)
 
-def _list_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True, "includeItemsFromAllDrives": True, "corpora": "allDrives"}
-    return {}
+
+# =========================
+# Drive kwargs by operation
+# =========================
+def _list_kwargs_for_drive(drive_id: Optional[str] = None):
+    kwargs = {
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+    }
+    if drive_id:
+        kwargs["corpora"] = "drive"
+        kwargs["driveId"] = drive_id
+    else:
+        kwargs["corpora"] = "allDrives"
+    return kwargs
+
+
+def _write_kwargs():
+    return {
+        "supportsAllDrives": True,
+    }
+
 
 def _get_media_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True}
-    return {}
+    return {
+        "supportsAllDrives": True,
+    }
+
 
 # =========================
 # Drive helpers
 # =========================
 def _escape_drive_q_value(s: str) -> str:
-    """
-    Escape a value embedded inside Drive API 'q' string single quotes.
-
-    Drive query string literals are wrapped with single quotes. A single quote inside
-    must be backslash-escaped: \'
-    Also escape backslashes for safety.
-    """
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
-def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None):
+
+def list_shared_drives(service) -> List[dict]:
+    out = []
+    page_token = None
+    while True:
+        res = execute_with_retries(
+            service.drives().list(
+                pageSize=100,
+                pageToken=page_token,
+            )
+        )
+        out.extend(res.get("drives", []))
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return out
+
+
+def get_shared_drive_by_name(service, drive_name: str) -> dict:
+    drives = list_shared_drives(service)
+    matches = [d for d in drives if d.get("name") == drive_name]
+
+    if not matches:
+        available = sorted([d.get("name", "") for d in drives])
+        raise RuntimeError(
+            f"Shared Drive '{drive_name}' not found.\n"
+            f"Visible Shared Drives: {available}"
+        )
+
+    if len(matches) > 1:
+        print(f"[WARN] Multiple Shared Drives named '{drive_name}'. Using first match.")
+
+    return matches[0]
+
+
+def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
     if mime_type:
         q_parts.append(f"mimeType = '{_escape_drive_q_value(mime_type)}'")
@@ -178,10 +231,10 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
         res = execute_with_retries(
             service.files().list(
                 q=q,
-                fields="nextPageToken, files(id,name,mimeType,size,modifiedTime)",
+                fields="nextPageToken, files(id,name,mimeType,size,modifiedTime,parents,driveId)",
                 pageSize=1000,
                 pageToken=page_token,
-                **_list_kwargs(),
+                **_list_kwargs_for_drive(drive_id),
             )
         )
         for f in res.get("files", []):
@@ -190,16 +243,13 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
         if not page_token:
             break
 
-def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None):
-    """
-    Robust lookup by name that avoids Drive q-escaping pitfalls:
-    - lists children (optionally filtered by mimeType)
-    - matches the exact name in Python
-    """
-    for f in drive_list_children(service, parent_id, mime_type):
+
+def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
+    for f in drive_list_children(service, parent_id, mime_type, drive_id):
         if f.get("name") == name:
             return f
     return None
+
 
 def drive_download_file(service, file_id: str, dest_path: Path):
     request = service.files().get_media(fileId=file_id, **_get_media_kwargs())
@@ -220,40 +270,39 @@ def drive_download_file(service, file_id: str, dest_path: Path):
             if status:
                 print(f"      [DL  ] {int(status.progress() * 100)}%")
 
-def drive_upload_text(service, parent_id: str, filename: str, local_path: Path):
-    existing = drive_find_child(service, parent_id, filename, None)
-    media = MediaFileUpload(str(local_path), mimetype="text/plain", resumable=True)
+
+def drive_upload_text_content(service, parent_id: str, filename: str, content: str, drive_id: Optional[str] = None):
+    existing = drive_find_child(service, parent_id, filename, None, drive_id)
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(content.encode("utf-8")),
+        mimetype="text/plain",
+        resumable=False,
+    )
 
     if existing:
         execute_with_retries(
-            service.files().update(fileId=existing["id"], media_body=media, **_list_kwargs())
+            service.files().update(
+                fileId=existing["id"],
+                media_body=media,
+                **_write_kwargs(),
+            )
         )
     else:
         meta = {"name": filename, "parents": [parent_id]}
         execute_with_retries(
-            service.files().create(body=meta, media_body=media, fields="id", **_list_kwargs())
+            service.files().create(
+                body=meta,
+                media_body=media,
+                fields="id",
+                **_write_kwargs(),
+            )
         )
 
-def debug_list_root_folders(service, limit=200):
-    res = execute_with_retries(
-        service.files().list(
-            q="('root' in parents) and trashed=false and mimeType='application/vnd.google-apps.folder'",
-            fields="files(id,name)",
-            pageSize=limit,
-            **_list_kwargs(),
-        )
-    )
-    print("\n[DEBUG] Top-level folders in My Drive:")
-    files = sorted(res.get("files", []), key=lambda x: x["name"].lower())
-    for f in files:
-        print(" -", f["name"])
 
-def drive_search_folder_anywhere_in_my_drive(service, folder_name: str) -> List[dict]:
-    """
-    Search ALL folders matching name. Paginated. Returns list of folder dicts.
-    """
+def drive_search_folder_anywhere_in_shared_drive(service, folder_name: str, drive_id: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
-    q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed=false"
+    q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed = false"
 
     out = []
     page_token = None
@@ -261,10 +310,10 @@ def drive_search_folder_anywhere_in_my_drive(service, folder_name: str) -> List[
         res = execute_with_retries(
             service.files().list(
                 q=q,
-                fields="nextPageToken, files(id,name,parents,modifiedTime)",
+                fields="nextPageToken, files(id,name,parents,modifiedTime,driveId)",
                 pageSize=1000,
                 pageToken=page_token,
-                **_list_kwargs(),
+                **_list_kwargs_for_drive(drive_id),
             )
         )
         out.extend(res.get("files", []))
@@ -273,19 +322,21 @@ def drive_search_folder_anywhere_in_my_drive(service, folder_name: str) -> List[
             break
     return out
 
+
 # =========================
 # SLOT SELECTION
 # =========================
-def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
+def list_slot_folders(service, slots_parent_id: str, drive_id: str) -> List[dict]:
     return sorted(
-        list(drive_list_children(service, slots_parent_id, FOLDER_MIME)),
+        list(drive_list_children(service, slots_parent_id, FOLDER_MIME, drive_id)),
         key=lambda x: x["name"].lower(),
     )
 
-def choose_slot(service, slots_parent_id: str) -> dict:
-    slots = list_slot_folders(service, slots_parent_id)
+
+def choose_slot(service, slots_parent_id: str, drive_id: str) -> dict:
+    slots = list_slot_folders(service, slots_parent_id, drive_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026.")
+        raise RuntimeError("No slot folders found under 2026 inside the selected Shared Drive.")
 
     if SLOT_CHOICE_ENV.isdigit():
         idx = int(SLOT_CHOICE_ENV)
@@ -311,25 +362,22 @@ def choose_slot(service, slots_parent_id: str) -> dict:
             idx = int(choice)
             if 1 <= idx <= len(slots):
                 return slots[idx - 1]
-        print(" Invalid choice. Try again.")
+        print("Invalid choice. Try again.")
+
 
 # =========================
-# Audio helpers (ffmpeg)
+# Audio helpers
 # =========================
 def is_video_name(name: str) -> bool:
     p = Path(name)
-
     if p.name.startswith("."):
         return False
-
     if p.suffix.lower() not in VIDEO_EXTS:
         return False
-
-    # Skip eye-tracker generated/processed videos
     if "__EYE_" in p.name:
         return False
-
     return True
+
 
 def extract_audio_wav(video_path: Path, wav_path: Path):
     proc = subprocess.run(
@@ -341,15 +389,18 @@ def extract_audio_wav(video_path: Path, wav_path: Path):
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed:\n{proc.stderr}")
 
+
 def wav_duration_seconds(wav_path: Path) -> float:
     with contextlib.closing(wave.open(str(wav_path), "rb")) as wf:
         return wf.getnframes() / float(wf.getframerate())
+
 
 def split_audio(wav_path: Path, chunk_seconds: int, overlap_seconds: int):
     total_seconds = wav_duration_seconds(wav_path)
     chunks = []
     idx = 0
     start = 0.0
+
     while start < total_seconds:
         ss = max(0.0, start - (overlap_seconds if idx > 0 else 0.0))
         duration = chunk_seconds + (overlap_seconds if idx > 0 else 0.0)
@@ -364,22 +415,25 @@ def split_audio(wav_path: Path, chunk_seconds: int, overlap_seconds: int):
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg split failed:\n{proc.stderr}")
 
-        chunks.append((out, ss, start))  # chunk_path, actual_start, logical_start
+        chunks.append((out, ss, start))
         start += chunk_seconds
         idx += 1
 
     return chunks
+
 
 def fmt_ts(seconds: float) -> str:
     s = int(math.floor(seconds or 0.0))
     m, s = divmod(s, 60)
     return f"{m}:{s:02d}"
 
+
 # =========================
 # OpenAI helpers
 # =========================
 def pick_chunks(resp_json: dict):
     return resp_json.get("segments") or resp_json.get("chunks") or resp_json.get("results") or []
+
 
 def to_timestamp_lines(chunks, include_speaker=False):
     out = []
@@ -394,6 +448,7 @@ def to_timestamp_lines(chunks, include_speaker=False):
             prefix += f"{speaker}: "
         out.append((start, prefix + text))
     return out
+
 
 def transcribe_diarize_with_http(wav_path: Path, max_retries: int = 6) -> dict:
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -431,11 +486,11 @@ def transcribe_diarize_with_http(wav_path: Path, max_retries: int = 6) -> dict:
 
         raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
 
+
 # =========================
 # MAIN
 # =========================
 def main():
-    # Ensure ffmpeg exists
     try:
         subprocess.run(
             ["ffmpeg", "-version"],
@@ -446,45 +501,61 @@ def main():
     except Exception:
         raise RuntimeError("ffmpeg not found in PATH. Install ffmpeg and restart terminal.")
 
+    if not SHARED_DRIVE_NAME:
+        raise RuntimeError("SHARED_DRIVE_NAME is required. Example: SHARED_DRIVE_NAME=2026_Shared_Drive")
+
     service = get_drive_service()
 
-    # Find your "2026" folder ANYWHERE
-    candidates = drive_search_folder_anywhere_in_my_drive(service, ROOT_2026_FOLDER_NAME)
+    print(f"[INFO] Shared-Drive-only mode enabled")
+    print(f"[INFO] SHARED_DRIVE_NAME={SHARED_DRIVE_NAME}")
+    print(f"[INFO] ROOT_2026_FOLDER_NAME={ROOT_2026_FOLDER_NAME}")
+
+    shared_drive = get_shared_drive_by_name(service, SHARED_DRIVE_NAME)
+    shared_drive_id = shared_drive["id"]
+
+    print(f"[INFO] Using Shared Drive: {shared_drive['name']} ({shared_drive_id})")
+
+    candidates = drive_search_folder_anywhere_in_shared_drive(service, ROOT_2026_FOLDER_NAME, shared_drive_id)
     if not candidates:
-        debug_list_root_folders(service)
         raise RuntimeError(
-            f"Could not find folder '{ROOT_2026_FOLDER_NAME}'.\n"
-            "It may be named differently or inside another folder.\n"
-            "Check [DEBUG] list above and update ROOT_2026_FOLDER_NAME."
+            f"Could not find folder '{ROOT_2026_FOLDER_NAME}' inside Shared Drive '{SHARED_DRIVE_NAME}'."
         )
 
-    # If multiple, pick most recently modified (stable default)
     candidates.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
     if len(candidates) > 1:
-        print(f"\n[WARN] Multiple folders named: {ROOT_2026_FOLDER_NAME}")
+        print(f"\n[WARN] Multiple folders named '{ROOT_2026_FOLDER_NAME}' inside Shared Drive '{SHARED_DRIVE_NAME}'.")
         for c in candidates[:10]:
-            print(" - id:", c["id"], "modified:", c.get("modifiedTime"), "parents:", c.get("parents"))
-        print("[WARN] Using the most recently modified one.\n")
+            print(
+                " - id:", c["id"],
+                "modified:", c.get("modifiedTime"),
+                "parents:", c.get("parents"),
+                "driveId:", c.get("driveId"),
+            )
+        print("[WARN] Using the most recently modified one inside this Shared Drive.\n")
 
     root_2026_id = candidates[0]["id"]
-    slots_parent_id = root_2026_id
 
-    # Pick slot (auto via SLOT_CHOICE or interactive)
-    slot = choose_slot(service, slots_parent_id)
+    slot = choose_slot(service, root_2026_id, shared_drive_id)
 
-    total = done = skipped = failed = 0
+    total = 0
+    done = 0
+    skipped = 0
+    failed = 0
 
-    people = sorted(list(drive_list_children(service, slot["id"], FOLDER_MIME)), key=lambda x: x["name"])
+    people = sorted(
+        list(drive_list_children(service, slot["id"], FOLDER_MIME, shared_drive_id)),
+        key=lambda x: x["name"]
+    )
 
     for person in people:
         for folder_name in FOLDER_NAMES_TO_PROCESS:
-            target = drive_find_child(service, person["id"], folder_name, FOLDER_MIME)
+            target = drive_find_child(service, person["id"], folder_name, FOLDER_MIME, shared_drive_id)
             if not target:
                 continue
 
             out_folder_id = target["id"]
 
-            children = list(drive_list_children(service, target["id"], None))
+            children = list(drive_list_children(service, target["id"], None, shared_drive_id))
             videos = sorted(
                 [f for f in children if f.get("mimeType") != FOLDER_MIME and is_video_name(f["name"])],
                 key=lambda x: x["name"],
@@ -500,10 +571,9 @@ def main():
 
             for vid in videos:
                 total += 1
-
                 out_txt_name = transcript_output_name(vid["name"])
 
-                existing_out = drive_find_child(service, out_folder_id, out_txt_name, None)
+                existing_out = drive_find_child(service, out_folder_id, out_txt_name, None, shared_drive_id)
                 if existing_out and not FORCE_RETRANSCRIBE:
                     skipped += 1
                     print(f"  [SKIP] {vid['name']} -> {out_txt_name} exists")
@@ -514,11 +584,8 @@ def main():
                         td = Path(td)
 
                         safe_vid_name = safe_local_filename(vid["name"], "video.mp4")
-                        safe_txt_name = safe_local_filename(out_txt_name, out_txt_name)
-
                         local_video = td / safe_vid_name
                         local_wav = td / f"{Path(safe_vid_name).stem}__tmp.wav"
-                        local_txt = td / safe_txt_name
 
                         print(f"  [DL  ] {vid['name']} -> downloading")
                         drive_download_file(service, vid["id"], local_video)
@@ -540,7 +607,6 @@ def main():
 
                                 for rel_start, line in lines:
                                     abs_start = rel_start + actual_ss
-                                    # Drop overlap lines that belong to the previous chunk
                                     if i > 0 and abs_start < logical_start:
                                         continue
                                     merged.append(
@@ -554,11 +620,10 @@ def main():
 
                         merged.sort(key=lambda x: x[0])
 
-                        # Light dedupe (0.5s buckets)
                         final_lines = []
                         seen = set()
                         for abs_start, line in merged:
-                            bucket = int(abs_start * 2)  # 0.5-second buckets
+                            bucket = int(abs_start * 2)
                             tail = line.split(":", 1)[-1].strip().lower()
                             key = (bucket, tail)
                             if key in seen:
@@ -566,10 +631,12 @@ def main():
                             seen.add(key)
                             final_lines.append(line)
 
-                        local_txt.write_text("\n".join(final_lines).strip() + "\n", encoding="utf-8")
+                        transcript_text = "\n".join(final_lines).strip()
+                        if transcript_text:
+                            transcript_text += "\n"
 
                         print(f"  [UP  ] uploading -> {slot['name']}/{person['name']}/{folder_name}/{out_txt_name}")
-                        drive_upload_text(service, out_folder_id, out_txt_name, local_txt)
+                        drive_upload_text_content(service, out_folder_id, out_txt_name, transcript_text, shared_drive_id)
 
                         done += 1
                         print("  [OK  ] done")
@@ -580,7 +647,9 @@ def main():
 
     print("\nSUMMARY")
     print("Total:", total, "Done:", done, "Skipped:", skipped, "Failed:", failed)
-    print("Output root folder:", ROOT_2026_FOLDER_NAME)
+    print("Shared Drive:", SHARED_DRIVE_NAME)
+    print("Root folder:", ROOT_2026_FOLDER_NAME)
+
 
 if __name__ == "__main__":
     main()

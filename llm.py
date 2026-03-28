@@ -13,10 +13,9 @@ import requests
 from dotenv import load_dotenv
 
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.errors import HttpError
+from google.oauth2 import service_account
 
 # ============================================================
 # ENV
@@ -27,31 +26,24 @@ OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set. Put it in .env as OPENAI_API_KEY=...")
 
-# Non-interactive slot selection (1-based index)
 SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()
-
-# Optional model override
 MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-nano").strip()
-
-# Shared drives flag from env (optional)
-USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
-
-# Headless auth (optional)
-HEADLESS_AUTH = (os.getenv("HEADLESS_AUTH") or "").strip().lower() in ("1", "true", "yes", "y")
-
-# Second pass rerun failed tasks (optional)
 RERUN_FAILED_ONCE = (os.getenv("RERUN_FAILED_ONCE") or "true").strip().lower() in ("1", "true", "yes", "y")
 
 # ============================================================
-# CONFIG (Drive)
+# AUTH / DRIVE CONFIG
 # ============================================================
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-CREDENTIALS_FILE = Path("credentials.json")
-TOKEN_FILE = Path("token.json")
+SERVICE_ACCOUNT_FILE = Path((os.getenv("SERVICE_ACCOUNT_FILE") or "service-account.json").strip())
+AUTH_MODE = (os.getenv("AUTH_MODE") or "service_account").strip().lower()
+USE_DELEGATION = (os.getenv("USE_DELEGATION") or "").strip().lower() in ("1", "true", "yes", "y")
+DELEGATED_USER_EMAIL = (os.getenv("DELEGATED_USER_EMAIL") or "").strip()
+
+SHARED_DRIVE_NAME = (os.getenv("SHARED_DRIVE_NAME") or "").strip()
+ROOT_2026_FOLDER_NAME = (os.getenv("ROOT_2026_FOLDER_NAME") or "2026").strip()
+
 FOLDER_MIME = "application/vnd.google-apps.folder"
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
-
-ROOT_2026_FOLDER_NAME = "2026"  # can be nested anywhere in My Drive
 
 # ============================================================
 # CONFIG (Local Prompt Folder)
@@ -76,7 +68,6 @@ FOLDER_TO_PROMPT = {
     "12. JD Video": "JD-prompt.txt",
 }
 
-# Prompts that should include candidate CV as input_file
 PROMPT_NEEDS_CV = {
     "project-scenario.txt",
     "niche-prompt.txt",
@@ -88,15 +79,13 @@ PROMPT_NEEDS_CV = {
     "smalltalk.txt",
 }
 
-# Prompts that require diagram images from SAME deliverable folder
-# We attach as input_image (base64 data URL)
 PROMPT_NEEDS_PNG = {
     "Tools-Technology-prompt.txt",
     "System-design.txt",
 }
 
 # ============================================================
-# CONFIG (Reference PDFs) - now inside local ./pdf folder
+# CONFIG (Reference PDFs)
 # ============================================================
 PDF_DIR = Path("pdf")
 if not PDF_DIR.exists():
@@ -116,17 +105,17 @@ if not MOCK_REFERENCE_PDF.exists():
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 OPENAI_FILES_URL = "https://api.openai.com/v1/files"
 OPENAI_FILE_PURPOSE = "user_data"
-
-MAX_TRANSCRIPT_CHARS = 250_000  # safety limit
+MAX_TRANSCRIPT_CHARS = 250_000
 
 # ============================================================
 # MIME types
 # ============================================================
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 DOC_MIME = "application/msword"
+PDF_MIME = "application/pdf"
 
 # ============================================================
-# Windows-safe local filenames (fix Errno 22)
+# Windows-safe local filenames
 # ============================================================
 _WINDOWS_FORBIDDEN = r'<>:"/\\|?*'
 _WINDOWS_RESERVED = {
@@ -145,98 +134,179 @@ def safe_local_filename(name: str, fallback: str = "file.txt") -> str:
     if stem.upper() in _WINDOWS_RESERVED:
         stem = f"_{stem}"
     name = stem + (dot + ext if dot else "")
-
     return name or fallback
 
 # ============================================================
-# Google Drive Auth
+# Retry helpers
+# ============================================================
+def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1.0):
+    for attempt in range(max_retries):
+        try:
+            return request.execute()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            if status in (429, 500, 502, 503, 504):
+                if attempt == max_retries - 1:
+                    raise
+                sleep = (base_sleep * (2 ** attempt)) + 0.25
+                print(f"[WARN] Drive API transient error HTTP {status}. Retrying in {sleep:.1f}s...")
+                time.sleep(sleep)
+                continue
+            raise
+
+def request_with_retries(method, url, *, max_tries=6, base_sleep=1.0, **kwargs):
+    last_exc = None
+    for attempt in range(1, max_tries + 1):
+        try:
+            r = method(url, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_exc = e
+            r = None
+
+        if r is not None and r.status_code in (200, 201):
+            return r
+
+        retryable = False
+        retry_after = None
+
+        if r is None:
+            retryable = True
+        else:
+            retryable = r.status_code in (429, 500, 502, 503, 504)
+            retry_after = r.headers.get("retry-after")
+
+        if not retryable or attempt == max_tries:
+            if r is None and last_exc:
+                raise last_exc
+            return r
+
+        sleep_s = base_sleep * (2 ** (attempt - 1))
+        if retry_after and str(retry_after).isdigit():
+            sleep_s = max(sleep_s, float(retry_after))
+        time.sleep(sleep_s)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("request_with_retries: exhausted retries with unknown error")
+
+# ============================================================
+# Google Drive Auth (Service Account)
 # ============================================================
 def get_drive_service():
-    creds = None
-    if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    if AUTH_MODE != "service_account":
+        raise RuntimeError(f"Unsupported AUTH_MODE='{AUTH_MODE}'. Use AUTH_MODE=service_account")
 
-    # If token exists but scopes changed, refresh will fail -> force new login
-    if creds and set(creds.scopes or []) != set(SCOPES):
-        print("[AUTH] token.json scopes mismatch. Deleting token.json and re-authenticating...")
-        TOKEN_FILE.unlink(missing_ok=True)
-        creds = None
+    if not SERVICE_ACCOUNT_FILE.exists():
+        raise FileNotFoundError(
+            f"Service account file not found: {SERVICE_ACCOUNT_FILE}\n"
+            f"Set SERVICE_ACCOUNT_FILE in .env or keep service-account.json beside script."
+        )
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-            except Exception as e:
-                print(f"[AUTH] Refresh failed ({e}). Re-authenticating...")
-                TOKEN_FILE.unlink(missing_ok=True)
-                creds = None
+    creds = service_account.Credentials.from_service_account_file(
+        str(SERVICE_ACCOUNT_FILE),
+        scopes=SCOPES,
+    )
 
-        if not creds or not creds.valid:
-            if not CREDENTIALS_FILE.exists():
-                raise FileNotFoundError("credentials.json not found next to this script.")
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-            if HEADLESS_AUTH:
-                creds = flow.run_console()
-            else:
-                creds = flow.run_local_server(port=0)
-            TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+    if USE_DELEGATION:
+        if not DELEGATED_USER_EMAIL:
+            raise RuntimeError("USE_DELEGATION=true but DELEGATED_USER_EMAIL is empty.")
+        creds = creds.with_subject(DELEGATED_USER_EMAIL)
+        print(f"[AUTH] Service account with delegation -> {DELEGATED_USER_EMAIL}")
+    else:
+        print("[AUTH] Service account without delegation")
 
     return build("drive", "v3", credentials=creds)
 
-def _list_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True, "includeItemsFromAllDrives": True, "corpora": "allDrives"}
-    return {}
-
-def _get_media_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True}
-    return {}
+# ============================================================
+# Drive kwargs by operation
+# ============================================================
+def _list_kwargs_for_drive(drive_id: Optional[str] = None):
+    kwargs = {
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+    }
+    if drive_id:
+        kwargs["corpora"] = "drive"
+        kwargs["driveId"] = drive_id
+    else:
+        kwargs["corpora"] = "allDrives"
+    return kwargs
 
 def _write_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True}
-    return {}
+    return {"supportsAllDrives": True}
+
+def _get_media_kwargs():
+    return {"supportsAllDrives": True}
 
 # ============================================================
 # Drive helpers
 # ============================================================
 def _escape_drive_q_value(s: str) -> str:
-    return s.replace("'", "''")
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
-def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None):
-    safe_name = _escape_drive_q_value(name)
-    q_parts = [f"'{parent_id}' in parents", "trashed = false", f"name = '{safe_name}'"]
-    if mime_type:
-        q_parts.append(f"mimeType = '{mime_type}'")
-    q = " and ".join(q_parts)
+def list_shared_drives(service) -> List[dict]:
+    out = []
+    page_token = None
+    while True:
+        res = execute_with_retries(
+            service.drives().list(
+                pageSize=100,
+                pageToken=page_token,
+            )
+        )
+        out.extend(res.get("drives", []))
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return out
 
-    res = service.files().list(
-        q=q, fields="files(id,name,mimeType,modifiedTime)", pageSize=50, **_list_kwargs()
-    ).execute()
-    files = res.get("files", []) or []
-    return sorted(files, key=lambda f: f.get("modifiedTime") or "", reverse=True)[0] if files else None
+def get_shared_drive_by_name(service, drive_name: str) -> dict:
+    drives = list_shared_drives(service)
+    matches = [d for d in drives if d.get("name") == drive_name]
 
-def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None):
+    if not matches:
+        available = sorted([d.get("name", "") for d in drives])
+        raise RuntimeError(
+            f"Shared Drive '{drive_name}' not found.\n"
+            f"Visible Shared Drives: {available}"
+        )
+
+    if len(matches) > 1:
+        print(f"[WARN] Multiple Shared Drives named '{drive_name}'. Using first match.")
+
+    return matches[0]
+
+def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
     if mime_type:
-        q_parts.append(f"mimeType = '{mime_type}'")
+        q_parts.append(f"mimeType = '{_escape_drive_q_value(mime_type)}'")
     q = " and ".join(q_parts)
 
     page_token = None
     while True:
-        res = service.files().list(
-            q=q,
-            fields="nextPageToken, files(id,name,mimeType,size,modifiedTime)",
-            pageSize=1000,
-            pageToken=page_token,
-            **_list_kwargs(),
-        ).execute()
+        res = execute_with_retries(
+            service.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,mimeType,size,modifiedTime,parents,driveId)",
+                pageSize=1000,
+                pageToken=page_token,
+                **_list_kwargs_for_drive(drive_id),
+            )
+        )
         for f in res.get("files", []):
             yield f
         page_token = res.get("nextPageToken")
         if not page_token:
             break
+
+def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
+    matches = []
+    for f in drive_list_children(service, parent_id, mime_type, drive_id):
+        if f.get("name") == name:
+            matches.append(f)
+    if not matches:
+        return None
+    return sorted(matches, key=lambda f: f.get("modifiedTime") or "", reverse=True)[0]
 
 def drive_download_file(service, file_id: str, dest_path: Path):
     request = service.files().get_media(fileId=file_id, **_get_media_kwargs())
@@ -244,10 +314,17 @@ def drive_download_file(service, file_id: str, dest_path: Path):
         downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 8)
         done = False
         while not done:
-            _, done = downloader.next_chunk()
+            try:
+                _, done = downloader.next_chunk()
+            except HttpError as e:
+                status = getattr(e.resp, "status", None)
+                if status in (429, 500, 502, 503, 504):
+                    time.sleep(1.0)
+                    continue
+                raise
 
 def drive_export_google_doc_to_pdf(service, file_id: str, dest_path: Path):
-    request = service.files().export_media(fileId=file_id, mimeType="application/pdf", **_get_media_kwargs())
+    request = service.files().export_media(fileId=file_id, mimeType="application/pdf")
     with io.FileIO(str(dest_path), "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 8)
         done = False
@@ -255,7 +332,7 @@ def drive_export_google_doc_to_pdf(service, file_id: str, dest_path: Path):
             _, done = downloader.next_chunk()
 
 def drive_export_google_doc_to_text(service, file_id: str, dest_path: Path):
-    request = service.files().export_media(fileId=file_id, mimeType="text/plain", **_get_media_kwargs())
+    request = service.files().export_media(fileId=file_id, mimeType="text/plain")
     with io.FileIO(str(dest_path), "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 8)
         done = False
@@ -269,36 +346,69 @@ def drive_download_or_export_text(service, f: dict, dest_path: Path):
     else:
         drive_download_file(service, f["id"], dest_path)
 
-def drive_upload_text(service, parent_id: str, filename: str, local_path: Path):
-    existing = drive_find_child(service, parent_id, filename, None)
-    media = MediaFileUpload(str(local_path), mimetype="text/plain", resumable=True)
+def drive_upload_text_content(service, parent_id: str, filename: str, content: str, drive_id: Optional[str] = None):
+    existing = drive_find_child(service, parent_id, filename, None, drive_id)
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(content.encode("utf-8")),
+        mimetype="text/plain",
+        resumable=False,
+    )
+
     if existing:
-        service.files().update(fileId=existing["id"], media_body=media, **_write_kwargs()).execute()
+        execute_with_retries(
+            service.files().update(
+                fileId=existing["id"],
+                media_body=media,
+                **_write_kwargs(),
+            )
+        )
     else:
         meta = {"name": filename, "parents": [parent_id]}
-        service.files().create(body=meta, media_body=media, fields="id", **_write_kwargs()).execute()
+        execute_with_retries(
+            service.files().create(
+                body=meta,
+                media_body=media,
+                fields="id",
+                **_write_kwargs(),
+            )
+        )
 
-def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
+def drive_search_folder_anywhere_in_shared_drive(service, folder_name: str, drive_id: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
-    q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed=false"
-    res = service.files().list(
-        q=q, fields="files(id,name,parents,modifiedTime)", pageSize=200, **_list_kwargs()
-    ).execute()
-    return res.get("files", []) or []
+    q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed = false"
 
-def pick_best_named_folder(candidates: List[dict]) -> dict:
-    return sorted(candidates, key=lambda c: c.get("modifiedTime") or "", reverse=True)[0]
+    out = []
+    page_token = None
+    while True:
+        res = execute_with_retries(
+            service.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,parents,modifiedTime,driveId)",
+                pageSize=1000,
+                pageToken=page_token,
+                **_list_kwargs_for_drive(drive_id),
+            )
+        )
+        out.extend(res.get("files", []))
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return out
 
 # ============================================================
-# SLOT SELECTION (supports SLOT_CHOICE env)
+# SLOT SELECTION
 # ============================================================
-def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
-    return sorted(list(drive_list_children(service, slots_parent_id, FOLDER_MIME)), key=lambda x: x["name"].lower())
+def list_slot_folders(service, slots_parent_id: str, drive_id: str) -> List[dict]:
+    return sorted(
+        list(drive_list_children(service, slots_parent_id, FOLDER_MIME, drive_id)),
+        key=lambda x: x["name"].lower()
+    )
 
-def choose_slot(service, slots_parent_id: str) -> dict:
-    slots = list_slot_folders(service, slots_parent_id)
+def choose_slot(service, slots_parent_id: str, drive_id: str) -> dict:
+    slots = list_slot_folders(service, slots_parent_id, drive_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026.")
+        raise RuntimeError("No slot folders found under 2026 inside the selected Shared Drive.")
 
     if SLOT_CHOICE.isdigit():
         idx = int(SLOT_CHOICE)
@@ -323,35 +433,42 @@ def choose_slot(service, slots_parent_id: str) -> dict:
             idx = int(choice)
             if 1 <= idx <= len(slots):
                 return slots[idx - 1]
-        print(" Invalid choice. Try again.")
+        print("Invalid choice. Try again.")
 
 # ============================================================
-# Convert Office (DOCX/DOC) -> PDF via Google (no LibreOffice)
+# Convert Office (DOCX/DOC) -> PDF via Google
 # ============================================================
 def drive_convert_office_to_pdf_via_google(service, office_file_id: str, dest_pdf_path: Path) -> None:
     body = {"name": f"__TEMP_CONVERT__{office_file_id}", "mimeType": GOOGLE_DOC_MIME}
-    temp = service.files().copy(fileId=office_file_id, body=body, fields="id", **_write_kwargs()).execute()
+    temp = execute_with_retries(
+        service.files().copy(
+            fileId=office_file_id,
+            body=body,
+            fields="id",
+            **_write_kwargs(),
+        )
+    )
     temp_id = temp["id"]
 
     try:
         drive_export_google_doc_to_pdf(service, temp_id, dest_pdf_path)
     finally:
         try:
-            service.files().delete(fileId=temp_id, **_write_kwargs()).execute()
+            execute_with_retries(service.files().delete(fileId=temp_id, **_write_kwargs()))
         except Exception:
             pass
 
 # ============================================================
-# Resume discovery (in 2026/<Slot>/<Person>/)
+# Resume discovery
 # ============================================================
 def is_resume_like(name: str) -> bool:
     n = name.lower()
     return ("resume" in n) or ("cv" in n)
 
-def find_candidate_resume_file(service, person_folder_id: str) -> Optional[dict]:
-    files = list(drive_list_children(service, person_folder_id, None))
+def find_candidate_resume_file(service, person_folder_id: str, drive_id: str) -> Optional[dict]:
+    files = list(drive_list_children(service, person_folder_id, None, drive_id))
 
-    pdfs = [f for f in files if is_resume_like(f["name"]) and f.get("mimeType") == "application/pdf"]
+    pdfs = [f for f in files if is_resume_like(f["name"]) and f.get("mimeType") == PDF_MIME]
     if pdfs:
         return sorted(pdfs, key=lambda x: x["name"])[0]
 
@@ -363,7 +480,7 @@ def find_candidate_resume_file(service, person_folder_id: str) -> Optional[dict]
     if word_docs:
         return sorted(word_docs, key=lambda x: x["name"])[0]
 
-    anypdf = [f for f in files if f.get("mimeType") == "application/pdf"]
+    anypdf = [f for f in files if f.get("mimeType") == PDF_MIME]
     if len(anypdf) == 1:
         return anypdf[0]
 
@@ -375,13 +492,11 @@ def find_candidate_resume_file(service, person_folder_id: str) -> Optional[dict]
 
 # ============================================================
 # Transcript aggregation
-#   - Default: only *_transcripts.txt
-#   - JD folder: include *_transcripts.txt + any other .txt JD files (exclude LLM_OUTPUT__)
 # ============================================================
-def read_all_transcripts_in_folder(service, transcript_folder_id: str, folder_name: str) -> str:
+def read_all_transcripts_in_folder(service, transcript_folder_id: str, folder_name: str, drive_id: str) -> str:
     txts: List[dict] = []
 
-    for f in drive_list_children(service, transcript_folder_id, None):
+    for f in drive_list_children(service, transcript_folder_id, None, drive_id):
         if f.get("mimeType") == FOLDER_MIME:
             continue
 
@@ -391,15 +506,12 @@ def read_all_transcripts_in_folder(service, transcript_folder_id: str, folder_na
         if not lname.endswith(".txt"):
             continue
 
-        # Always ignore model outputs
         if lname.startswith("llm_output__"):
             continue
 
         if folder_name == "12. JD Video":
-            # JD folder: include ALL .txt (both transcripts + JD text files)
             txts.append(f)
         else:
-            # Other folders: include only transcripts produced by transcription script
             if lname.endswith("_transcripts.txt"):
                 txts.append(f)
 
@@ -425,9 +537,9 @@ def read_all_transcripts_in_folder(service, transcript_folder_id: str, folder_na
         combined = combined[:MAX_TRANSCRIPT_CHARS] + "\n\n[TRUNCATED DUE TO SIZE LIMIT]\n"
     return combined
 
-def download_pngs_in_folder(service, folder_id: str, temp_dir: Path) -> List[Path]:
+def download_pngs_in_folder(service, folder_id: str, temp_dir: Path, drive_id: str) -> List[Path]:
     png_paths: List[Path] = []
-    for f in drive_list_children(service, folder_id, None):
+    for f in drive_list_children(service, folder_id, None, drive_id):
         if f.get("mimeType") == FOLDER_MIME:
             continue
         name = (f.get("name") or "").lower()
@@ -471,42 +583,6 @@ class OpenAIFileCache:
         self.data[digest] = file_id
         self.cache_path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
 
-def request_with_retries(method, url, *, max_tries=6, base_sleep=1.0, **kwargs):
-    last_exc = None
-    for attempt in range(1, max_tries + 1):
-        try:
-            r = method(url, **kwargs)
-        except (requests.Timeout, requests.ConnectionError) as e:
-            last_exc = e
-            r = None
-
-        if r is not None and r.status_code in (200, 201):
-            return r
-
-        retryable = False
-        retry_after = None
-
-        if r is None:
-            retryable = True
-        else:
-            retryable = r.status_code in (429, 500, 502, 503, 504)
-            retry_after = r.headers.get("retry-after")
-
-        if not retryable or attempt == max_tries:
-            if r is None and last_exc:
-                raise last_exc
-            return r
-
-        sleep_s = base_sleep * (2 ** (attempt - 1))
-        if retry_after and str(retry_after).isdigit():
-            sleep_s = max(sleep_s, float(retry_after))
-
-        time.sleep(sleep_s)
-
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("request_with_retries: exhausted retries with unknown error")
-
 def openai_upload_file(path: Path, mime: str, cache: OpenAIFileCache) -> str:
     digest = sha256_file(path)
     cached = cache.get(digest)
@@ -514,10 +590,18 @@ def openai_upload_file(path: Path, mime: str, cache: OpenAIFileCache) -> str:
         return cached
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    files = {"file": (path.name, open(path, "rb"), mime)}
-    data = {"purpose": OPENAI_FILE_PURPOSE}
+    with open(path, "rb") as f:
+        files = {"file": (path.name, f, mime)}
+        data = {"purpose": OPENAI_FILE_PURPOSE}
+        r = request_with_retries(
+            requests.post,
+            OPENAI_FILES_URL,
+            headers=headers,
+            files=files,
+            data=data,
+            timeout=600,
+        )
 
-    r = request_with_retries(requests.post, OPENAI_FILES_URL, headers=headers, files=files, data=data, timeout=600)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"OpenAI Files upload failed: HTTP {r.status_code}: {r.text}")
 
@@ -528,13 +612,11 @@ def openai_upload_file(path: Path, mime: str, cache: OpenAIFileCache) -> str:
 def openai_upload_pdf(path: Path, cache: OpenAIFileCache) -> str:
     return openai_upload_file(path, "application/pdf", cache)
 
-# ✅ FIXED: image_url must be a STRING (URL or data URL), not an object {"url": ...}
 def png_to_input_image_part(png_path: Path) -> dict:
     b64 = base64.b64encode(png_path.read_bytes()).decode("utf-8")
     return {
         "type": "input_image",
         "image_url": f"data:image/png;base64,{b64}",
-        # "detail": "auto",  # optional
     }
 
 def openai_run_prompt(
@@ -561,10 +643,15 @@ def openai_run_prompt(
             content_parts.append(png_to_input_image_part(p))
 
     content_parts.append({"type": "input_text", "text": f"\n\nTRANSCRIPT:\n{transcript_text}\n"})
-
     payload = {"model": MODEL, "input": [{"role": "user", "content": content_parts}]}
 
-    r = request_with_retries(requests.post, OPENAI_RESPONSES_URL, headers=headers, json=payload, timeout=600)
+    r = request_with_retries(
+        requests.post,
+        OPENAI_RESPONSES_URL,
+        headers=headers,
+        json=payload,
+        timeout=600,
+    )
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI Responses failed: HTTP {r.status_code}: {r.text}")
 
@@ -585,49 +672,75 @@ def openai_run_prompt(
 # MAIN
 # ============================================================
 def main():
+    if not SHARED_DRIVE_NAME:
+        raise RuntimeError("SHARED_DRIVE_NAME is required. Example: SHARED_DRIVE_NAME=2026_Shared_Drive")
+
     service = get_drive_service()
 
-    candidates = drive_search_folder_anywhere(service, ROOT_2026_FOLDER_NAME)
+    print("[INFO] Shared-Drive-only mode enabled")
+    print(f"[INFO] SHARED_DRIVE_NAME={SHARED_DRIVE_NAME}")
+    print(f"[INFO] ROOT_2026_FOLDER_NAME={ROOT_2026_FOLDER_NAME}")
+
+    shared_drive = get_shared_drive_by_name(service, SHARED_DRIVE_NAME)
+    shared_drive_id = shared_drive["id"]
+
+    print(f"[INFO] Using Shared Drive: {shared_drive['name']} ({shared_drive_id})")
+
+    candidates = drive_search_folder_anywhere_in_shared_drive(service, ROOT_2026_FOLDER_NAME, shared_drive_id)
     if not candidates:
-        raise RuntimeError(f"Could not find folder '{ROOT_2026_FOLDER_NAME}' anywhere in Drive.")
+        raise RuntimeError(
+            f"Could not find folder '{ROOT_2026_FOLDER_NAME}' inside Shared Drive '{SHARED_DRIVE_NAME}'."
+        )
 
-    base_2026 = pick_best_named_folder(candidates)
-    slots_parent_id = base_2026["id"]
+    candidates.sort(key=lambda x: x.get("modifiedTime", ""), reverse=True)
+    if len(candidates) > 1:
+        print(f"[WARN] Multiple folders named '{ROOT_2026_FOLDER_NAME}' inside Shared Drive '{SHARED_DRIVE_NAME}'.")
+        for c in candidates[:10]:
+            print(
+                " - id:", c["id"],
+                "modified:", c.get("modifiedTime"),
+                "parents:", c.get("parents"),
+                "driveId:", c.get("driveId"),
+            )
+        print("[WARN] Using the most recently modified one inside this Shared Drive.\n")
 
-    slot = choose_slot(service, slots_parent_id)
+    base_2026 = candidates[0]
+    slot = choose_slot(service, base_2026["id"], shared_drive_id)
 
     file_cache = OpenAIFileCache()
-
-    # Upload reference PDFs once (cached)
     niche_pdf_file_id = openai_upload_pdf(NICHE_REFERENCE_PDF, file_cache)
     mock_pdf_file_id = openai_upload_pdf(MOCK_REFERENCE_PDF, file_cache)
 
-    people = sorted(list(drive_list_children(service, slot["id"], FOLDER_MIME)), key=lambda x: x["name"])
+    people = sorted(
+        list(drive_list_children(service, slot["id"], FOLDER_MIME, shared_drive_id)),
+        key=lambda x: x["name"]
+    )
 
     failed_tasks: List[Tuple[str, str, str, str]] = []
-    # (person_name, folder_name, prompt_filename, out_name)
 
     for person in people:
         print("\n" + "=" * 90)
         print(f"[PERSON] {slot['name']} / {person['name']}")
 
-        folder_nodes = sorted(list(drive_list_children(service, person["id"], FOLDER_MIME)), key=lambda x: x["name"])
+        folder_nodes = sorted(
+            list(drive_list_children(service, person["id"], FOLDER_MIME, shared_drive_id)),
+            key=lambda x: x["name"]
+        )
         person_needs_cv = any((FOLDER_TO_PROMPT.get(fn["name"]) in PROMPT_NEEDS_CV) for fn in folder_nodes)
 
-        resume_file = find_candidate_resume_file(service, person["id"])
+        resume_file = find_candidate_resume_file(service, person["id"], shared_drive_id)
         cv_pdf_file_id = None
 
         with tempfile.TemporaryDirectory() as td_str:
             td = Path(td_str)
 
-            # --- CV upload (only if needed) ---
             if person_needs_cv:
                 if resume_file:
                     local_cv_pdf = td / "candidate_cv.pdf"
                     mt = resume_file.get("mimeType")
 
                     try:
-                        if mt == "application/pdf":
+                        if mt == PDF_MIME:
                             drive_download_file(service, resume_file["id"], local_cv_pdf)
                         elif mt == GOOGLE_DOC_MIME:
                             drive_export_google_doc_to_pdf(service, resume_file["id"], local_cv_pdf)
@@ -653,7 +766,6 @@ def main():
             else:
                 print("[CV] Not needed for this person (no CV-dependent prompts).")
 
-            # --- Run deliverable prompts ---
             for folder_node in folder_nodes:
                 folder_name = folder_node["name"]
                 prompt_filename = FOLDER_TO_PROMPT.get(folder_name)
@@ -666,12 +778,12 @@ def main():
                     continue
 
                 out_name = f"LLM_OUTPUT__{prompt_filename.replace('.txt', '')}.txt"
-                existing = drive_find_child(service, folder_node["id"], out_name, None)
+                existing = drive_find_child(service, folder_node["id"], out_name, None, shared_drive_id)
                 if existing:
                     print(f"[SKIP] Output exists: {person['name']}/{folder_name}/{out_name}")
                     continue
 
-                transcript_text = read_all_transcripts_in_folder(service, folder_node["id"], folder_name)
+                transcript_text = read_all_transcripts_in_folder(service, folder_node["id"], folder_name, shared_drive_id)
                 if not transcript_text.strip():
                     print(f"[SKIP] No transcripts: {person['name']}/{folder_name}")
                     continue
@@ -680,13 +792,12 @@ def main():
 
                 needs_cv = prompt_filename in PROMPT_NEEDS_CV
                 use_cv_id = cv_pdf_file_id if needs_cv else None
-
                 use_niche_id = niche_pdf_file_id if prompt_filename == "niche-prompt.txt" else None
                 use_mock_id = mock_pdf_file_id if prompt_filename == "mock-prompt.txt" else None
 
                 image_paths: List[Path] = []
                 if prompt_filename in PROMPT_NEEDS_PNG:
-                    image_paths = download_pngs_in_folder(service, folder_node["id"], td)
+                    image_paths = download_pngs_in_folder(service, folder_node["id"], td, shared_drive_id)
                     if not image_paths:
                         print(f"[WARN] No .png found in {person['name']}/{folder_name} but prompt expects diagram(s).")
 
@@ -702,9 +813,13 @@ def main():
                         image_paths=image_paths if image_paths else None,
                     )
 
-                    local_out = td / safe_local_filename(out_name, out_name)
-                    local_out.write_text(result.strip() + "\n", encoding="utf-8")
-                    drive_upload_text(service, folder_node["id"], out_name, local_out)
+                    drive_upload_text_content(
+                        service,
+                        folder_node["id"],
+                        out_name,
+                        result.strip() + "\n",
+                        shared_drive_id,
+                    )
                     print("[OK  ] uploaded")
 
                 except Exception as e:
@@ -713,9 +828,6 @@ def main():
 
                 time.sleep(0.5)
 
-    # ============================================================
-    # SECOND PASS: rerun failed tasks once
-    # ============================================================
     if RERUN_FAILED_ONCE and failed_tasks:
         print("\n" + "=" * 90)
         print(f"[RERUN] Second pass for failed tasks: {len(failed_tasks)}")
@@ -723,7 +835,10 @@ def main():
 
         slot_people = {
             p["name"]: p
-            for p in sorted(list(drive_list_children(service, slot["id"], FOLDER_MIME)), key=lambda x: x["name"])
+            for p in sorted(
+                list(drive_list_children(service, slot["id"], FOLDER_MIME, shared_drive_id)),
+                key=lambda x: x["name"]
+            )
         }
 
         for person_name, folder_name, prompt_filename, out_name in failed_tasks:
@@ -733,13 +848,13 @@ def main():
                     print(f"[RERUN][SKIP] Person missing: {person_name}")
                     continue
 
-                person_folders = {f["name"]: f for f in drive_list_children(service, person["id"], FOLDER_MIME)}
+                person_folders = {f["name"]: f for f in drive_list_children(service, person["id"], FOLDER_MIME, shared_drive_id)}
                 folder_node = person_folders.get(folder_name)
                 if not folder_node:
                     print(f"[RERUN][SKIP] Folder missing: {person_name}/{folder_name}")
                     continue
 
-                existing = drive_find_child(service, folder_node["id"], out_name, None)
+                existing = drive_find_child(service, folder_node["id"], out_name, None, shared_drive_id)
                 if existing:
                     print(f"[RERUN][SKIP] Output exists now: {person_name}/{folder_name}/{out_name}")
                     continue
@@ -749,7 +864,7 @@ def main():
                     print(f"[RERUN][SKIP] Prompt missing: {prompt_filename}")
                     continue
 
-                transcript_text = read_all_transcripts_in_folder(service, folder_node["id"], folder_name)
+                transcript_text = read_all_transcripts_in_folder(service, folder_node["id"], folder_name, shared_drive_id)
                 if not transcript_text.strip():
                     print(f"[RERUN][SKIP] No transcripts: {person_name}/{folder_name}")
                     continue
@@ -759,14 +874,14 @@ def main():
                 needs_cv = prompt_filename in PROMPT_NEEDS_CV
                 cv_pdf_file_id_rerun = None
                 if needs_cv:
-                    resume_file = find_candidate_resume_file(service, person["id"])
+                    resume_file = find_candidate_resume_file(service, person["id"], shared_drive_id)
                     if resume_file:
                         with tempfile.TemporaryDirectory() as td_str:
                             td = Path(td_str)
                             local_cv_pdf = td / "candidate_cv.pdf"
                             mt = resume_file.get("mimeType")
 
-                            if mt == "application/pdf":
+                            if mt == PDF_MIME:
                                 drive_download_file(service, resume_file["id"], local_cv_pdf)
                             elif mt == GOOGLE_DOC_MIME:
                                 drive_export_google_doc_to_pdf(service, resume_file["id"], local_cv_pdf)
@@ -783,7 +898,7 @@ def main():
                 if prompt_filename in PROMPT_NEEDS_PNG:
                     with tempfile.TemporaryDirectory() as td_str:
                         td = Path(td_str)
-                        image_paths = download_pngs_in_folder(service, folder_node["id"], td)
+                        image_paths = download_pngs_in_folder(service, folder_node["id"], td, shared_drive_id)
 
                 print(f"[RERUN][RUN ] {person_name}/{folder_name} -> {out_name}")
 
@@ -796,11 +911,13 @@ def main():
                     image_paths=image_paths if image_paths else None,
                 )
 
-                with tempfile.TemporaryDirectory() as td_str:
-                    td = Path(td_str)
-                    local_out = td / safe_local_filename(out_name, out_name)
-                    local_out.write_text(result.strip() + "\n", encoding="utf-8")
-                    drive_upload_text(service, folder_node["id"], out_name, local_out)
+                drive_upload_text_content(
+                    service,
+                    folder_node["id"],
+                    out_name,
+                    result.strip() + "\n",
+                    shared_drive_id,
+                )
 
                 print("[RERUN][OK  ] uploaded")
 

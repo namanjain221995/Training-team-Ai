@@ -4,7 +4,7 @@ import socket
 import ssl
 import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Iterable, Dict, Set
 
 import httplib2
 from googleapiclient.discovery import build
@@ -72,19 +72,19 @@ SCRIPT_OUTPUTS = {
         "description": "'All Deliverables Analysis' Google Docs",
         "filename": "All Deliverables Analysis",
         "mime_types": [GDOC_MIME],
-        "location": "NOW STORED in Candidate Result/<Slot>/ (NOT in 2026/<Slot>/)",
+        "location": "in Candidate Result/<Slot>/",
     },
     "test5": {
         "description": "'Deliverables Analysis Sheet.xlsx' Excel files",
         "filename": "Deliverables Analysis Sheet.xlsx",
         "mime_types": [XLSX_MIME],
-        "location": "NOW STORED in Candidate Result/<Slot>/ (NOT in 2026/<Slot>/)",
+        "location": "in Candidate Result/<Slot>/",
     },
     "test6": {
         "description": "Eye/Face tracking outputs (__EYE_*)",
         "pattern": r".*__EYE_(annotated_h264\.mp4|summary\.json|result\.json|metrics\.csv)$",
         "mime_types": ["video/mp4", "application/json", "text/csv"],
-        "location": "in 2026/<Slot>/<Person>/<FolderName>/ (same folder as input video)",
+        "location": "in 2026/<Slot>/<Person>/<FolderName>/",
     },
 }
 
@@ -262,11 +262,11 @@ def resolve_output_root_folder(service) -> Optional[dict]:
         try:
             root = drive_get_folder_by_id(service, OUTPUT_ROOT_FOLDER_ID)
             if root.get("mimeType") != FOLDER_MIME:
-                print(" ⚠ OUTPUT_ROOT_FOLDER_ID is not a folder. Ignoring.")
+                print("⚠ OUTPUT_ROOT_FOLDER_ID is not a folder. Ignoring.")
                 return None
             return root
         except Exception as e:
-            print(f" ⚠ Failed to fetch OUTPUT_ROOT_FOLDER_ID: {e}")
+            print(f"⚠ Failed to fetch OUTPUT_ROOT_FOLDER_ID: {e}")
             return None
 
     cands = drive_search_folder_anywhere(service, OUTPUT_ROOT_FOLDER_NAME)
@@ -278,42 +278,50 @@ def resolve_output_root_folder(service) -> Optional[dict]:
 def resolve_output_slot_folder_existing(service, slot_name: str) -> Optional[dict]:
     """
     Returns Candidate Result/<SlotName> folder if it exists.
-    IMPORTANT: this function does NOT create folders (safe for deletion script).
+    IMPORTANT: does NOT create folders.
     """
     out_root = resolve_output_root_folder(service)
     if not out_root:
         return None
-    slot_folder = drive_find_child(service, out_root["id"], slot_name, FOLDER_MIME)
-    return slot_folder
+    return drive_find_child(service, out_root["id"], slot_name, FOLDER_MIME)
 
 
 # =========================
-# Slot selection helpers
+# Slot / Candidate selection helpers
 # =========================
 def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
-    """List slot folders under 2026 root."""
     return sorted(
         list(drive_list_children(service, slots_parent_id, FOLDER_MIME)),
         key=lambda x: (x.get("name") or "").lower(),
     )
 
 
+def list_people(service, slot_id: str) -> List[dict]:
+    return sorted(
+        [
+            p
+            for p in drive_list_children(service, slot_id, FOLDER_MIME)
+            if (p.get("name") or "").strip() not in SKIP_PERSON_FOLDERS
+        ],
+        key=lambda x: (x.get("name") or "").lower(),
+    )
+
+
 def choose_slot(service, slots_parent_id: str) -> Optional[dict]:
     """
-    Let user pick a slot folder.
+    Choose one slot or ALL.
     Returns:
-      - dict for selected slot
-      - None if user chooses ALL
+      - slot dict if one slot selected
+      - None if ALL slots selected
     """
     slots = list_slot_folders(service, slots_parent_id)
     if not slots:
-        print(" No slot folders found under '2026'.")
+        print("No slot folders found under '2026'.")
         return None
 
     print("\n" + "=" * 80)
-    print("SELECT SLOT FOLDER")
+    print("SELECT SLOT")
     print("=" * 80)
-
     for i, s in enumerate(slots, start=1):
         print(f"  {i:2}. {s['name']}")
     print("  ALL - All slots")
@@ -330,11 +338,99 @@ def choose_slot(service, slots_parent_id: str) -> Optional[dict]:
             idx = int(choice)
             if 1 <= idx <= len(slots):
                 return slots[idx - 1]
-        print(" Invalid choice. Try again.")
+        print("Invalid choice. Try again.")
 
 
-def iter_target_slots(service, slots_parent_id: str, only_slot: Optional[dict]):
-    """Yield selected slot only, or all slots."""
+def choose_candidate_mode() -> str:
+    """
+    Candidate mode only applies when one slot is selected.
+    Returns:
+      - one
+      - multiple
+      - all
+      - exit
+    """
+    print("\n" + "=" * 80)
+    print("SELECT CANDIDATE SCOPE")
+    print("=" * 80)
+    print("  1. One candidate")
+    print("  2. Multiple candidates")
+    print("  3. All candidates in this slot")
+    print("  4. Exit\n")
+
+    valid = {"1": "one", "2": "multiple", "3": "all", "4": "exit"}
+    while True:
+        choice = input("Choose option (1/2/3/4): ").strip()
+        if choice in valid:
+            return valid[choice]
+        print("Invalid choice. Try again.")
+
+
+def choose_candidates_for_slot(service, slot: dict) -> Optional[List[dict]]:
+    """
+    For one selected slot, let user choose:
+      - one candidate
+      - multiple candidates
+      - all candidates
+    Returns:
+      - list[dict] of selected candidates
+      - None means all candidates in that slot
+    """
+    candidates = list_people(service, slot["id"])
+    if not candidates:
+        print(f"No candidate folders found inside slot '{slot['name']}'.")
+        return []
+
+    mode = choose_candidate_mode()
+    if mode == "exit":
+        print("✓ Exiting without changes.")
+        raise SystemExit(0)
+
+    if mode == "all":
+        return None
+
+    print("\n" + "=" * 80)
+    print(f"SELECT CANDIDATE(S) IN SLOT: {slot['name']}")
+    print("=" * 80)
+    for i, c in enumerate(candidates, start=1):
+        print(f"  {i:2}. {c['name']}")
+    print("")
+
+    if mode == "one":
+        while True:
+            choice = input("Choose one candidate number: ").strip()
+            if choice.isdigit():
+                idx = int(choice)
+                if 1 <= idx <= len(candidates):
+                    return [candidates[idx - 1]]
+            print("Invalid choice. Try again.")
+
+    # mode == "multiple"
+    while True:
+        raw = input("Enter candidate numbers separated by comma (example: 1,3,5): ").strip()
+        if not raw:
+            print("Please enter at least one candidate number.")
+            continue
+
+        parts = [x.strip() for x in raw.split(",") if x.strip()]
+        if not parts:
+            print("Invalid input. Try again.")
+            continue
+
+        bad = [p for p in parts if not p.isdigit()]
+        if bad:
+            print(f"Invalid entries: {', '.join(bad)}")
+            continue
+
+        idxs = sorted(set(int(p) for p in parts))
+        if any(idx < 1 or idx > len(candidates) for idx in idxs):
+            print("One or more numbers are out of range.")
+            continue
+
+        return [candidates[idx - 1] for idx in idxs]
+
+
+def iter_target_slots(service, slots_parent_id: str, only_slot: Optional[dict]) -> Iterable[dict]:
     if only_slot:
         yield only_slot
     else:
@@ -342,23 +438,55 @@ def iter_target_slots(service, slots_parent_id: str, only_slot: Optional[dict]):
             yield s
 
 
-def iter_people(service, slot_id: str) -> List[dict]:
-    """List people folders under a slot (skipping SKIP_PERSON_FOLDERS)."""
-    return sorted(
-        [
-            p
-            for p in drive_list_children(service, slot_id, FOLDER_MIME)
-            if (p.get("name") or "").strip() not in SKIP_PERSON_FOLDERS
-        ],
-        key=lambda x: (x.get("name") or "").lower(),
-    )
+def iter_target_people(service, slot: dict, selected_people: Optional[List[dict]]) -> Iterable[dict]:
+    """
+    selected_people:
+      - None => all people in slot
+      - []   => none
+      - list => selected people only
+    """
+    if selected_people is None:
+        for p in list_people(service, slot["id"]):
+            yield p
+    else:
+        for p in selected_people:
+            yield p
 
 
 # =========================
-# Deletion functions for each script
+# Delete scope context
 # =========================
-def delete_test1_outputs(service, slots_parent_id: str, only_slot: Optional[dict]) -> int:
-    """Delete transcript .txt files created by test.py (within selected slot)."""
+class DeleteScope:
+    def __init__(self, slot: Optional[dict], selected_people: Optional[List[dict]]):
+        self.slot = slot
+        self.selected_people = selected_people
+
+    @property
+    def is_all_slots(self) -> bool:
+        return self.slot is None
+
+    @property
+    def is_slot_level_all_candidates(self) -> bool:
+        return self.slot is not None and self.selected_people is None
+
+    @property
+    def is_candidate_level(self) -> bool:
+        return self.slot is not None and self.selected_people is not None
+
+    def describe(self) -> str:
+        if self.is_all_slots:
+            return "ALL SLOTS / ALL CANDIDATES"
+        if self.selected_people is None:
+            return f"SLOT = {self.slot['name']} / ALL CANDIDATES"
+        names = ", ".join(p["name"] for p in self.selected_people) if self.selected_people else "(none)"
+        return f"SLOT = {self.slot['name']} / CANDIDATE(S) = {names}"
+
+
+# =========================
+# Deletion functions
+# =========================
+def delete_test1_outputs(service, slots_parent_id: str, scope: DeleteScope) -> int:
+    """Delete transcript .txt files created by test.py."""
     print("\n" + "=" * 80)
     print("DELETING TEST1 OUTPUTS (Transcript .txt files)")
     print("=" * 80)
@@ -366,8 +494,12 @@ def delete_test1_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     deleted_count = 0
     pattern = re.compile(r"^[^/]*\.txt$", re.IGNORECASE)
 
-    for slot in iter_target_slots(service, slots_parent_id, only_slot):
-        for person in iter_people(service, slot["id"]):
+    for slot in iter_target_slots(service, slots_parent_id, scope.slot):
+        selected_people = scope.selected_people if scope.slot and slot["id"] == scope.slot["id"] else None
+        if scope.is_all_slots:
+            selected_people = None
+
+        for person in iter_target_people(service, slot, selected_people):
             for folder_name in FOLDER_NAMES_TO_PROCESS:
                 target = drive_find_child(service, person["id"], folder_name, FOLDER_MIME)
                 if not target:
@@ -391,8 +523,8 @@ def delete_test1_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     return deleted_count
 
 
-def delete_test2_outputs(service, slots_parent_id: str, only_slot: Optional[dict]) -> int:
-    """Delete LLM_OUTPUT__*.txt files created by test2.py (within selected slot)."""
+def delete_test2_outputs(service, slots_parent_id: str, scope: DeleteScope) -> int:
+    """Delete LLM_OUTPUT__*.txt files created by test2.py."""
     print("\n" + "=" * 80)
     print("DELETING TEST2 OUTPUTS (LLM_OUTPUT__*.txt files)")
     print("=" * 80)
@@ -400,8 +532,12 @@ def delete_test2_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     deleted_count = 0
     pattern = re.compile(r"^LLM_OUTPUT__.*\.txt$", re.IGNORECASE)
 
-    for slot in iter_target_slots(service, slots_parent_id, only_slot):
-        for person in iter_people(service, slot["id"]):
+    for slot in iter_target_slots(service, slots_parent_id, scope.slot):
+        selected_people = scope.selected_people if scope.slot and slot["id"] == scope.slot["id"] else None
+        if scope.is_all_slots:
+            selected_people = None
+
+        for person in iter_target_people(service, slot, selected_people):
             for folder_name in FOLDER_NAMES_TO_PROCESS:
                 target = drive_find_child(service, person["id"], folder_name, FOLDER_MIME)
                 if not target:
@@ -409,7 +545,9 @@ def delete_test2_outputs(service, slots_parent_id: str, only_slot: Optional[dict
 
                 files = list(drive_list_children(service, target["id"], None))
                 llm_files = [
-                    f for f in files if f.get("mimeType") != FOLDER_MIME and pattern.match(f.get("name") or "")
+                    f
+                    for f in files
+                    if f.get("mimeType") != FOLDER_MIME and pattern.match(f.get("name") or "")
                 ]
 
                 if llm_files:
@@ -421,16 +559,20 @@ def delete_test2_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     return deleted_count
 
 
-def delete_test3_outputs(service, slots_parent_id: str, only_slot: Optional[dict]) -> int:
-    """Delete 'Deliverables Analysis' Google Docs created by test3.py (within selected slot)."""
+def delete_test3_outputs(service, slots_parent_id: str, scope: DeleteScope) -> int:
+    """Delete 'Deliverables Analysis' Google Docs created by test3.py."""
     print("\n" + "=" * 80)
     print("DELETING TEST3 OUTPUTS ('Deliverables Analysis' Google Docs)")
     print("=" * 80)
 
     deleted_count = 0
 
-    for slot in iter_target_slots(service, slots_parent_id, only_slot):
-        for person in iter_people(service, slot["id"]):
+    for slot in iter_target_slots(service, slots_parent_id, scope.slot):
+        selected_people = scope.selected_people if scope.slot and slot["id"] == scope.slot["id"] else None
+        if scope.is_all_slots:
+            selected_people = None
+
+        for person in iter_target_people(service, slot, selected_people):
             doc = drive_find_child(service, person["id"], "Deliverables Analysis", GDOC_MIME)
             if doc:
                 print(f"[{slot['name']}] {person['name']}")
@@ -440,7 +582,7 @@ def delete_test3_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     return deleted_count
 
 
-def delete_test4_outputs(service, slots_parent_id: str, only_slot: Optional[dict]) -> int:
+def delete_test4_outputs(service, slots_parent_id: str, scope: DeleteScope) -> int:
     """
     Delete 'All Deliverables Analysis' Google Docs created by test4.py.
 
@@ -451,14 +593,19 @@ def delete_test4_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     print("DELETING TEST4 OUTPUTS ('All Deliverables Analysis' Google Docs with tabs)")
     print("=" * 80)
 
+    if scope.is_candidate_level:
+        print("⚠ TEST4 is a SLOT-LEVEL file in Candidate Result/<Slot>/, not candidate-level.")
+        print("⚠ You selected specific candidate(s), so TEST4 deletion is skipped.")
+        return 0
+
     deleted_count = 0
 
     out_root = resolve_output_root_folder(service)
     if not out_root:
-        print(f" ⚠ Output root '{OUTPUT_ROOT_FOLDER_NAME}' not found. Skipping TEST4 deletions.")
+        print(f"⚠ Output root '{OUTPUT_ROOT_FOLDER_NAME}' not found. Skipping TEST4 deletions.")
         return 0
 
-    for slot in iter_target_slots(service, slots_parent_id, only_slot):
+    for slot in iter_target_slots(service, slots_parent_id, scope.slot):
         out_slot = resolve_output_slot_folder_existing(service, slot["name"])
         if not out_slot:
             continue
@@ -472,7 +619,7 @@ def delete_test4_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     return deleted_count
 
 
-def delete_test5_outputs(service, slots_parent_id: str, only_slot: Optional[dict]) -> int:
+def delete_test5_outputs(service, slots_parent_id: str, scope: DeleteScope) -> int:
     """
     Delete 'Deliverables Analysis Sheet.xlsx' Excel files created by test5.py.
 
@@ -483,14 +630,19 @@ def delete_test5_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     print("DELETING TEST5 OUTPUTS ('Deliverables Analysis Sheet.xlsx' Excel files)")
     print("=" * 80)
 
+    if scope.is_candidate_level:
+        print("⚠ TEST5 is a SLOT-LEVEL file in Candidate Result/<Slot>/, not candidate-level.")
+        print("⚠ You selected specific candidate(s), so TEST5 deletion is skipped.")
+        return 0
+
     deleted_count = 0
 
     out_root = resolve_output_root_folder(service)
     if not out_root:
-        print(f" ⚠ Output root '{OUTPUT_ROOT_FOLDER_NAME}' not found. Skipping TEST5 deletions.")
+        print(f"⚠ Output root '{OUTPUT_ROOT_FOLDER_NAME}' not found. Skipping TEST5 deletions.")
         return 0
 
-    for slot in iter_target_slots(service, slots_parent_id, only_slot):
+    for slot in iter_target_slots(service, slots_parent_id, scope.slot):
         out_slot = resolve_output_slot_folder_existing(service, slot["name"])
         if not out_slot:
             continue
@@ -504,10 +656,9 @@ def delete_test5_outputs(service, slots_parent_id: str, only_slot: Optional[dict
     return deleted_count
 
 
-def delete_test6_outputs(service, slots_parent_id: str, only_slot: Optional[dict]) -> int:
+def delete_test6_outputs(service, slots_parent_id: str, scope: DeleteScope) -> int:
     """
-    Delete __EYE_* outputs created by test6.py inside:
-      2026/<Slot>/<Person>/<FolderName>/
+    Delete __EYE_* outputs created by test6.py.
     """
     print("\n" + "=" * 80)
     print("DELETING TEST6 OUTPUTS (__EYE_* eye/face tracking files)")
@@ -519,8 +670,12 @@ def delete_test6_outputs(service, slots_parent_id: str, only_slot: Optional[dict
         re.IGNORECASE,
     )
 
-    for slot in iter_target_slots(service, slots_parent_id, only_slot):
-        for person in iter_people(service, slot["id"]):
+    for slot in iter_target_slots(service, slots_parent_id, scope.slot):
+        selected_people = scope.selected_people if scope.slot and slot["id"] == scope.slot["id"] else None
+        if scope.is_all_slots:
+            selected_people = None
+
+        for person in iter_target_people(service, slot, selected_people):
             for folder_name in FOLDER_NAMES_TO_PROCESS:
                 target = drive_find_child(service, person["id"], folder_name, FOLDER_MIME)
                 if not target:
@@ -543,10 +698,9 @@ def delete_test6_outputs(service, slots_parent_id: str, only_slot: Optional[dict
 
 
 # =========================
-# Menu & Main
+# Menu
 # =========================
-def show_menu():
-    """Display the deletion menu."""
+def show_delete_menu():
     print("\n" + "=" * 80)
     print("DELETE SCRIPT OUTPUTS FROM GOOGLE DRIVE")
     print("=" * 80)
@@ -559,77 +713,99 @@ def show_menu():
     print(f"  {'EXIT':6} - Exit without deleting anything\n")
 
 
-def get_user_choice() -> str:
-    """Get valid user input."""
+def get_delete_choice() -> str:
     valid_choices = list(SCRIPT_OUTPUTS.keys()) + ["all", "exit"]
     while True:
         choice = input("Enter your choice (test1/test2/test3/test4/test5/test6/all/exit): ").strip().lower()
         if choice in valid_choices:
             return choice
-        print(f" Invalid choice. Please enter one of: {', '.join(valid_choices)}")
+        print(f"Invalid choice. Please enter one of: {', '.join(valid_choices)}")
 
 
+# =========================
+# Main
+# =========================
 def main():
     service = get_drive_service()
 
-    # Find 2026
+    # Find 2026 root
     candidates = drive_search_folder_anywhere(service, ROOT_2026_FOLDER_NAME)
     if not candidates:
-        print(" Could not find folder '2026' in Drive.")
+        print("Could not find folder '2026' in Drive.")
         return
 
     base_2026 = pick_best_named_folder(candidates)
     slots_parent_id = base_2026["id"]
 
     print(
-        f"\nUsing 2026 folder: {base_2026['name']} (id={base_2026['id']}, modified={base_2026.get('modifiedTime')})"
+        f"\nUsing 2026 folder: {base_2026['name']} "
+        f"(id={base_2026['id']}, modified={base_2026.get('modifiedTime')})"
     )
 
-    show_menu()
-    choice = get_user_choice()
+    # Step 1: choose slot
+    selected_slot = choose_slot(service, slots_parent_id)
+
+    # Step 2: if one slot chosen, optionally choose one/multiple/all candidates
+    if selected_slot is None:
+        scope = DeleteScope(slot=None, selected_people=None)
+    else:
+        selected_people = choose_candidates_for_slot(service, selected_slot)
+        scope = DeleteScope(slot=selected_slot, selected_people=selected_people)
+
+    print("\n" + "=" * 80)
+    print("CURRENT TARGET")
+    print("=" * 80)
+    print(scope.describe())
+
+    # Step 3: choose what to delete
+    show_delete_menu()
+    choice = get_delete_choice()
 
     if choice == "exit":
         print("\n✓ Exiting without making any changes.")
         return
 
-    # Ask which slot folder to target
-    selected_slot = choose_slot(service, slots_parent_id)
+    # Confirm
+    print("\n" + "=" * 80)
+    print("CONFIRM DELETE")
+    print("=" * 80)
+    print(f"Target: {scope.describe()}")
+    print(f"Delete mode: {choice.upper()}")
+    if choice == "all":
+        print("This will delete outputs from ALL test groups that apply to the selected scope.")
+        print("NOTE: TEST4 and TEST5 are slot-level files inside Candidate Result/<Slot>/.")
+
+    confirm = input("Type 'YES' to confirm: ").strip()
+    if confirm != "YES":
+        print("Cancelled. No files were deleted.")
+        return
 
     total_deleted = 0
 
     if choice == "all":
-        print("\n  YOU ARE ABOUT TO DELETE ALL SCRIPT OUTPUTS (within selected slot/all slots)!")
-        print("  NOTE: TEST4 & TEST5 outputs are deleted from Candidate Result/<Slot>/ (not from 2026).")
-        confirm = input("Type 'YES' to confirm: ").strip()
-        if confirm != "YES":
-            print(" Cancelled. No files were deleted.")
-            return
-
-        total_deleted += delete_test1_outputs(service, slots_parent_id, selected_slot)
+        total_deleted += delete_test1_outputs(service, slots_parent_id, scope)
         time.sleep(0.5)
-        total_deleted += delete_test2_outputs(service, slots_parent_id, selected_slot)
+        total_deleted += delete_test2_outputs(service, slots_parent_id, scope)
         time.sleep(0.5)
-        total_deleted += delete_test3_outputs(service, slots_parent_id, selected_slot)
+        total_deleted += delete_test3_outputs(service, slots_parent_id, scope)
         time.sleep(0.5)
-        total_deleted += delete_test4_outputs(service, slots_parent_id, selected_slot)
+        total_deleted += delete_test4_outputs(service, slots_parent_id, scope)
         time.sleep(0.5)
-        total_deleted += delete_test5_outputs(service, slots_parent_id, selected_slot)
+        total_deleted += delete_test5_outputs(service, slots_parent_id, scope)
         time.sleep(0.5)
-        total_deleted += delete_test6_outputs(service, slots_parent_id, selected_slot)
-
-    else:
-        if choice == "test1":
-            total_deleted = delete_test1_outputs(service, slots_parent_id, selected_slot)
-        elif choice == "test2":
-            total_deleted = delete_test2_outputs(service, slots_parent_id, selected_slot)
-        elif choice == "test3":
-            total_deleted = delete_test3_outputs(service, slots_parent_id, selected_slot)
-        elif choice == "test4":
-            total_deleted = delete_test4_outputs(service, slots_parent_id, selected_slot)
-        elif choice == "test5":
-            total_deleted = delete_test5_outputs(service, slots_parent_id, selected_slot)
-        elif choice == "test6":
-            total_deleted = delete_test6_outputs(service, slots_parent_id, selected_slot)
+        total_deleted += delete_test6_outputs(service, slots_parent_id, scope)
+    elif choice == "test1":
+        total_deleted = delete_test1_outputs(service, slots_parent_id, scope)
+    elif choice == "test2":
+        total_deleted = delete_test2_outputs(service, slots_parent_id, scope)
+    elif choice == "test3":
+        total_deleted = delete_test3_outputs(service, slots_parent_id, scope)
+    elif choice == "test4":
+        total_deleted = delete_test4_outputs(service, slots_parent_id, scope)
+    elif choice == "test5":
+        total_deleted = delete_test5_outputs(service, slots_parent_id, scope)
+    elif choice == "test6":
+        total_deleted = delete_test6_outputs(service, slots_parent_id, scope)
 
     print("\n" + "=" * 80)
     print(f"✓ DELETION COMPLETE - {total_deleted} file(s) deleted")

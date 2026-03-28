@@ -1,5 +1,7 @@
 ﻿token*.json
 credentials*.json
+service-account.json 
+service-account-*.json
 .openai_file_cache.json
 .vscode/
 __pycache__/
@@ -14,6 +16,7 @@ models/**.onnx
 gmail_token.json
 *.token.json
 token.json
+
 
 
 # Secrets

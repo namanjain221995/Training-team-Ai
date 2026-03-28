@@ -11,56 +11,43 @@ from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 
 # =========================
 # ENV
 # =========================
 load_dotenv()
 
-# Non-interactive slot selection
-# Example in .env: SLOT_CHOICE=2
 SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()
 
-# Shared drives flag from env
-USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
-
-# Optional: safer than searching by folder name
-ROOT_2026_FOLDER_ID = (os.getenv("ROOT_2026_FOLDER_ID") or "").strip()
-
-# Optional skip list (comma-separated)
-# Example: SKIP_PERSON_FOLDERS=1. Format,Archive
 SKIP_PERSON_FOLDERS = {
     x.strip() for x in (os.getenv("SKIP_PERSON_FOLDERS") or "1. Format").split(",") if x.strip()
 }
 
-# Optional: headless auth support
-HEADLESS_AUTH = (os.getenv("HEADLESS_AUTH") or "").strip().lower() in ("1", "true", "yes", "y")
+AUTH_MODE = (os.getenv("AUTH_MODE") or "service_account").strip().lower()
+SERVICE_ACCOUNT_FILE = Path((os.getenv("SERVICE_ACCOUNT_FILE") or "service-account.json").strip())
+USE_DELEGATION = (os.getenv("USE_DELEGATION") or "").strip().lower() in ("1", "true", "yes", "y")
+DELEGATED_USER_EMAIL = (os.getenv("DELEGATED_USER_EMAIL") or "").strip()
+
+SHARED_DRIVE_NAME = (os.getenv("SHARED_DRIVE_NAME") or "").strip()
+ROOT_2026_FOLDER_NAME = (os.getenv("ROOT_2026_FOLDER_NAME") or "2026").strip()
+
+# Optional: exact root folder id inside selected Shared Drive
+ROOT_2026_FOLDER_ID = (os.getenv("ROOT_2026_FOLDER_ID") or "").strip()
 
 # =========================
 # CONFIG
 # =========================
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-CREDENTIALS_FILE = Path("credentials.json")
-TOKEN_FILE = Path("token.json")
-
-ROOT_2026_FOLDER_NAME = "2026"  # used if ROOT_2026_FOLDER_ID not provided
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 GDOC_MIME = "application/vnd.google-apps.document"
 
-# Only merge LLM output files matching this pattern
 LLM_OUTPUT_REGEX = re.compile(r"^LLM_OUTPUT__.*\.txt$", re.IGNORECASE)
-
-# Name for the Google Doc created in each person folder
 DOC_NAME = "Deliverables Analysis"
 
-# Retry config
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 6
-
 
 # =========================
 # Retry helpers
@@ -91,90 +78,121 @@ def drive_execute(req, label: str = "Drive API call"):
                 continue
             raise
 
-
 def is_retryable_http_error(e: Exception) -> bool:
     if not isinstance(e, HttpError):
         return False
     status = getattr(e.resp, "status", None)
     return status in RETRYABLE_STATUS_CODES
 
-
 # =========================
 # Drive auth
 # =========================
 def get_drive_service():
-    creds = None
+    if AUTH_MODE != "service_account":
+        raise RuntimeError(f"Unsupported AUTH_MODE='{AUTH_MODE}'. Use AUTH_MODE=service_account")
 
-    if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+    if not SERVICE_ACCOUNT_FILE.exists():
+        raise FileNotFoundError(
+            f"Service account file not found: {SERVICE_ACCOUNT_FILE}\n"
+            f"Set SERVICE_ACCOUNT_FILE in .env or place service-account.json next to this script."
+        )
 
-    # If token exists but scopes changed, refresh will fail. Force new login.
-    if creds and set(creds.scopes or []) != set(SCOPES):
-        print("[AUTH] token.json scopes mismatch. Deleting token.json and re-authenticating...")
-        TOKEN_FILE.unlink(missing_ok=True)
-        creds = None
+    creds = service_account.Credentials.from_service_account_file(
+        str(SERVICE_ACCOUNT_FILE),
+        scopes=SCOPES,
+    )
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
-            except Exception as e:
-                print(f"[AUTH] Refresh failed ({e}). Re-authenticating...")
-                TOKEN_FILE.unlink(missing_ok=True)
-                creds = None
-
-        if not creds or not creds.valid:
-            if not CREDENTIALS_FILE.exists():
-                raise FileNotFoundError("credentials.json not found next to this script.")
-
-            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-
-            if HEADLESS_AUTH:
-                creds = flow.run_console()
-            else:
-                creds = flow.run_local_server(port=0)
-
-            TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+    if USE_DELEGATION:
+        if not DELEGATED_USER_EMAIL:
+            raise RuntimeError("USE_DELEGATION=true but DELEGATED_USER_EMAIL is empty.")
+        creds = creds.with_subject(DELEGATED_USER_EMAIL)
+        print(f"[AUTH] Service account with delegation -> {DELEGATED_USER_EMAIL}")
+    else:
+        print("[AUTH] Service account without delegation")
 
     return build("drive", "v3", credentials=creds)
 
+# =========================
+# Drive kwargs
+# =========================
+def _list_kwargs_for_drive(drive_id: Optional[str] = None):
+    kwargs = {
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+    }
+    if drive_id:
+        kwargs["corpora"] = "drive"
+        kwargs["driveId"] = drive_id
+    else:
+        kwargs["corpora"] = "allDrives"
+    return kwargs
 
-def _list_kwargs():
-    if USE_SHARED_DRIVES:
-        return {
-            "supportsAllDrives": True,
-            "includeItemsFromAllDrives": True,
-            "corpora": "allDrives",
-        }
-    return {}
-
-
-def _get_media_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True}
-    return {}
-
+def _get_kwargs():
+    return {"supportsAllDrives": True}
 
 def _write_kwargs():
-    if USE_SHARED_DRIVES:
-        return {"supportsAllDrives": True}
-    return {}
-
+    return {"supportsAllDrives": True}
 
 # =========================
 # Drive helpers
 # =========================
 def _escape_drive_q_value(s: str) -> str:
-    return s.replace("'", "''")
-
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
 def _slot_sort_key(name: str):
     m = re.search(r"(\d+)", name or "")
     return (int(m.group(1)) if m else float("inf"), (name or "").lower())
 
+def list_shared_drives(service) -> List[dict]:
+    out = []
+    page_token = None
+    while True:
+        res = drive_execute(
+            service.drives().list(
+                pageSize=100,
+                pageToken=page_token,
+            ),
+            label="list shared drives",
+        )
+        out.extend(res.get("drives", []))
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return out
 
-def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None):
+def get_shared_drive_by_name(service, drive_name: str) -> dict:
+    drives = list_shared_drives(service)
+    matches = [d for d in drives if d.get("name") == drive_name]
+
+    if not matches:
+        available = sorted([d.get("name", "") for d in drives])
+        raise RuntimeError(
+            f"Shared Drive '{drive_name}' not found.\n"
+            f"Visible Shared Drives: {available}"
+        )
+
+    if len(matches) > 1:
+        print(f"[WARN] Multiple Shared Drives named '{drive_name}'. Using first match.")
+
+    return matches[0]
+
+def drive_get_file(service, file_id: str) -> dict:
+    return drive_execute(
+        service.files().get(
+            fileId=file_id,
+            fields="id,name,parents,modifiedTime,mimeType,driveId",
+            **_get_kwargs(),
+        ),
+        label=f"get file {file_id}",
+    )
+
+def drive_find_child(
+    service,
+    parent_id: str,
+    name: str,
+    mime_type: Optional[str] = None,
+    drive_id: Optional[str] = None,
+):
     safe_name = _escape_drive_q_value(name)
     q_parts = [f"'{parent_id}' in parents", "trashed = false", f"name = '{safe_name}'"]
     if mime_type:
@@ -184,9 +202,9 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
     res = drive_execute(
         service.files().list(
             q=q,
-            fields="files(id,name,mimeType,modifiedTime)",
+            fields="files(id,name,mimeType,modifiedTime,driveId)",
             pageSize=50,
-            **_list_kwargs(),
+            **_list_kwargs_for_drive(drive_id),
         ),
         label=f"find child '{name}' in parent {parent_id}",
     )
@@ -194,8 +212,7 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
     files = res.get("files", []) or []
     return sorted(files, key=lambda f: f.get("modifiedTime") or "", reverse=True)[0] if files else None
 
-
-def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None):
+def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
     if mime_type:
         q_parts.append(f"mimeType = '{mime_type}'")
@@ -206,10 +223,10 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
         res = drive_execute(
             service.files().list(
                 q=q,
-                fields="nextPageToken, files(id,name,mimeType,modifiedTime,size)",
+                fields="nextPageToken, files(id,name,mimeType,modifiedTime,size,driveId)",
                 pageSize=1000,
                 pageToken=page_token,
-                **_list_kwargs(),
+                **_list_kwargs_for_drive(drive_id),
             ),
             label=f"list children of parent {parent_id}",
         )
@@ -221,11 +238,10 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
         if not page_token:
             break
 
-
 def drive_download_text(service, file_id: str) -> str:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            request = service.files().get_media(fileId=file_id, **_get_media_kwargs())
+            request = service.files().get_media(fileId=file_id, **_get_kwargs())
             fh = io.BytesIO()
             downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 4)
 
@@ -249,13 +265,14 @@ def drive_download_text(service, file_id: str) -> str:
                 continue
             raise
 
-
-def drive_create_or_replace_gdoc_from_text(service, parent_id: str, doc_name: str, text: str):
-    """
-    Creates a Google Doc in parent folder.
-    If exists, deletes and recreates it.
-    """
-    existing = drive_find_child(service, parent_id, doc_name, GDOC_MIME)
+def drive_create_or_replace_gdoc_from_text(
+    service,
+    parent_id: str,
+    doc_name: str,
+    text: str,
+    drive_id: Optional[str] = None,
+):
+    existing = drive_find_child(service, parent_id, doc_name, GDOC_MIME, drive_id)
     if existing:
         drive_execute(
             service.files().delete(fileId=existing["id"], **_write_kwargs()),
@@ -280,52 +297,45 @@ def drive_create_or_replace_gdoc_from_text(service, parent_id: str, doc_name: st
     )
     return created["id"]
 
-
-def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
+def drive_search_folder_anywhere_in_shared_drive(service, folder_name: str, drive_id: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
     q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed = false"
 
-    res = drive_execute(
-        service.files().list(
-            q=q,
-            fields="files(id,name,parents,modifiedTime)",
-            pageSize=200,
-            **_list_kwargs(),
-        ),
-        label=f"search folder '{folder_name}' anywhere",
-    )
-    return res.get("files", []) or []
-
-
-def drive_get_file(service, file_id: str) -> dict:
-    return drive_execute(
-        service.files().get(
-            fileId=file_id,
-            fields="id,name,parents,modifiedTime,mimeType",
-            **_get_media_kwargs(),
-        ),
-        label=f"get file {file_id}",
-    )
-
+    out = []
+    page_token = None
+    while True:
+        res = drive_execute(
+            service.files().list(
+                q=q,
+                fields="nextPageToken, files(id,name,parents,modifiedTime,driveId,mimeType)",
+                pageSize=1000,
+                pageToken=page_token,
+                **_list_kwargs_for_drive(drive_id),
+            ),
+            label=f"search folder '{folder_name}' in shared drive {drive_id}",
+        )
+        out.extend(res.get("files", []))
+        page_token = res.get("nextPageToken")
+        if not page_token:
+            break
+    return out
 
 def pick_best_named_folder(candidates: List[dict]) -> dict:
     return sorted(candidates, key=lambda c: c.get("modifiedTime") or "", reverse=True)[0]
 
-
 # =========================
 # SLOT SELECTION
 # =========================
-def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
+def list_slot_folders(service, slots_parent_id: str, drive_id: str) -> List[dict]:
     return sorted(
-        list(drive_list_children(service, slots_parent_id, FOLDER_MIME)),
+        list(drive_list_children(service, slots_parent_id, FOLDER_MIME, drive_id)),
         key=lambda x: _slot_sort_key(x.get("name") or ""),
     )
 
-
-def choose_slot(service, slots_parent_id: str) -> dict:
-    slots = list_slot_folders(service, slots_parent_id)
+def choose_slot(service, slots_parent_id: str, drive_id: str) -> dict:
+    slots = list_slot_folders(service, slots_parent_id, drive_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026.")
+        raise RuntimeError("No slot folders found under 2026 inside the selected Shared Drive.")
 
     if SLOT_CHOICE.isdigit():
         idx = int(SLOT_CHOICE)
@@ -352,18 +362,18 @@ def choose_slot(service, slots_parent_id: str) -> dict:
                 return slots[idx - 1]
         print("Invalid choice. Try again.")
 
-
 # =========================
 # Merge logic
 # =========================
-def build_person_doc_content(service, slot_name: str, person_name: str, person_folder_id: str) -> str:
-    """
-    Looks inside 2026/<Slot>/<Person>/<FolderName>
-    Collects LLM_OUTPUT__*.txt from each FolderName.
-    Builds one combined text.
-    """
+def build_person_doc_content(
+    service,
+    slot_name: str,
+    person_name: str,
+    person_folder_id: str,
+    drive_id: str,
+) -> str:
     folder_nodes = sorted(
-        list(drive_list_children(service, person_folder_id, FOLDER_MIME)),
+        list(drive_list_children(service, person_folder_id, FOLDER_MIME, drive_id)),
         key=lambda x: (x.get("name") or "").lower(),
     )
 
@@ -382,7 +392,7 @@ def build_person_doc_content(service, slot_name: str, person_name: str, person_f
         folder_name = folder_node["name"]
 
         try:
-            files = list(drive_list_children(service, folder_node["id"], None))
+            files = list(drive_list_children(service, folder_node["id"], None, drive_id))
         except Exception as e:
             sections.append(f"\n\n## {folder_name}\n" + "-" * 90)
             sections.append(f"\n[ERROR READING FOLDER] {e}")
@@ -420,31 +430,62 @@ def build_person_doc_content(service, slot_name: str, person_name: str, person_f
     sections.append("\n")
     return "\n".join(sections)
 
-
 # =========================
 # MAIN
 # =========================
 def main():
+    if not SHARED_DRIVE_NAME:
+        raise RuntimeError("SHARED_DRIVE_NAME is required. Example: SHARED_DRIVE_NAME=2026_Shared_Drive")
+
     service = get_drive_service()
+
+    print("[INFO] Shared-Drive-only mode enabled")
+    print(f"[INFO] SHARED_DRIVE_NAME={SHARED_DRIVE_NAME}")
+    print(f"[INFO] ROOT_2026_FOLDER_NAME={ROOT_2026_FOLDER_NAME}")
+
+    shared_drive = get_shared_drive_by_name(service, SHARED_DRIVE_NAME)
+    shared_drive_id = shared_drive["id"]
+
+    print(f"[INFO] Using Shared Drive: {shared_drive['name']} ({shared_drive_id})")
 
     if ROOT_2026_FOLDER_ID:
         print(f"[ROOT] Using ROOT_2026_FOLDER_ID={ROOT_2026_FOLDER_ID}")
         base_2026 = drive_get_file(service, ROOT_2026_FOLDER_ID)
+
         if base_2026.get("mimeType") != FOLDER_MIME:
             raise RuntimeError(f"ROOT_2026_FOLDER_ID={ROOT_2026_FOLDER_ID} is not a folder.")
+
+        file_drive_id = base_2026.get("driveId")
+        if file_drive_id and file_drive_id != shared_drive_id:
+            raise RuntimeError(
+                f"ROOT_2026_FOLDER_ID belongs to driveId={file_drive_id}, "
+                f"but SHARED_DRIVE_NAME resolved to driveId={shared_drive_id}."
+            )
     else:
-        candidates = drive_search_folder_anywhere(service, ROOT_2026_FOLDER_NAME)
+        candidates = drive_search_folder_anywhere_in_shared_drive(service, ROOT_2026_FOLDER_NAME, shared_drive_id)
         if not candidates:
-            raise RuntimeError(f"Could not find folder '{ROOT_2026_FOLDER_NAME}' anywhere in Drive.")
+            raise RuntimeError(
+                f"Could not find folder '{ROOT_2026_FOLDER_NAME}' inside Shared Drive '{SHARED_DRIVE_NAME}'."
+            )
+
+        if len(candidates) > 1:
+            print(f"[WARN] Multiple folders named '{ROOT_2026_FOLDER_NAME}' inside Shared Drive '{SHARED_DRIVE_NAME}'.")
+            for c in candidates[:10]:
+                print(
+                    " - id:", c["id"],
+                    "modified:", c.get("modifiedTime"),
+                    "parents:", c.get("parents"),
+                    "driveId:", c.get("driveId"),
+                )
+            print("[WARN] Using the most recently modified one inside this Shared Drive.")
+
         base_2026 = pick_best_named_folder(candidates)
-        print(f"[ROOT] Found folder by name: {base_2026['name']} (id={base_2026['id']})")
+        print(f"[ROOT] Using folder: {base_2026['name']} (id={base_2026['id']})")
 
-    slots_parent_id = base_2026["id"]
-
-    slot = choose_slot(service, slots_parent_id)
+    slot = choose_slot(service, base_2026["id"], shared_drive_id)
 
     all_people = sorted(
-        list(drive_list_children(service, slot["id"], FOLDER_MIME)),
+        list(drive_list_children(service, slot["id"], FOLDER_MIME, shared_drive_id)),
         key=lambda x: (x.get("name") or "").lower(),
     )
 
@@ -469,6 +510,7 @@ def main():
                 slot_name=slot["name"],
                 person_name=person["name"],
                 person_folder_id=person["id"],
+                drive_id=shared_drive_id,
             )
 
             doc_id = drive_create_or_replace_gdoc_from_text(
@@ -476,6 +518,7 @@ def main():
                 parent_id=person["id"],
                 doc_name=DOC_NAME,
                 text=combined_text,
+                drive_id=shared_drive_id,
             )
 
             print(
@@ -495,7 +538,6 @@ def main():
     print("=" * 80)
     print(f"[SUMMARY] Success: {ok_count}")
     print(f"[SUMMARY] Failed : {fail_count}")
-
 
 if __name__ == "__main__":
     main()
