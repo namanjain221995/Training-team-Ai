@@ -22,9 +22,6 @@ from google.auth.transport.requests import Request
 
 load_dotenv()
 
-# =========================
-# CONFIG
-# =========================
 ROOT_2026_FOLDER_NAME = "2026"
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 
@@ -47,7 +44,6 @@ CHUNK_SECONDS = int((os.getenv("CHUNK_SECONDS") or "540").strip())
 OVERLAP_SECONDS = int((os.getenv("OVERLAP_SECONDS") or "2").strip())
 FORCE_RETRANSCRIBE = (os.getenv("FORCE_RETRANSCRIBE") or "").strip().lower() in ("1", "true", "yes", "y")
 
-# IMPORTANT: default to small for t2.micro safety (can override via env)
 WHISPER_MODEL = (os.getenv("WHISPER_MODEL") or "large-v3").strip()
 DEVICE = (os.getenv("DEVICE") or "cpu").strip()
 COMPUTE_TYPE = (os.getenv("COMPUTE_TYPE") or ("float16" if DEVICE == "cuda" else "int8")).strip()
@@ -67,15 +63,15 @@ VIDEO_FILE_ID = (os.getenv("VIDEO_FILE_ID") or "").strip()
 TARGET_FOLDER_ID = (os.getenv("TARGET_FOLDER_ID") or "").strip()
 VIDEO_NAME_ENV = (os.getenv("VIDEO_NAME") or "").strip()
 
-# =========================
-# WINDOWS-SAFE FILENAMES
-# =========================
 _WINDOWS_FORBIDDEN = r'<>:"/\\|?*'
 _WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+
+_SLOT_PREFIX_RE = re.compile(r"^\s*(\d+)\.\s*")
+
 
 def safe_local_filename(name: str, fallback: str = "file.bin") -> str:
     name = (name or "").strip() or fallback
@@ -88,12 +84,11 @@ def safe_local_filename(name: str, fallback: str = "file.bin") -> str:
     name = stem + (dot + ext if dot else "")
     return name or fallback
 
+
 def transcript_output_name(video_name: str) -> str:
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
 
-# =========================
-# RETRY WRAPPER
-# =========================
+
 def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1.0):
     for attempt in range(max_retries):
         try:
@@ -109,9 +104,7 @@ def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1
                 continue
             raise
 
-# =========================
-# DRIVE AUTH (headless-safe)
-# =========================
+
 def get_drive_service():
     creds = None
     if TOKEN_FILE.exists() and TOKEN_FILE.is_file():
@@ -129,7 +122,6 @@ def get_drive_service():
             if not CREDENTIALS_FILE.exists():
                 raise FileNotFoundError(f"{CREDENTIALS_FILE} not found.")
             if HEADLESS_AUTH:
-                # Workers / CI should never do interactive auth
                 raise RuntimeError(
                     "Drive token is missing/invalid in this environment. "
                     "Update /transcription/worker/token_json in SSM Parameter Store with a valid token.json."
@@ -142,26 +134,33 @@ def get_drive_service():
 
     return build("drive", "v3", credentials=creds)
 
+
 def _list_kwargs():
     if USE_SHARED_DRIVES:
         return {"supportsAllDrives": True, "includeItemsFromAllDrives": True, "corpora": "allDrives"}
     return {}
+
 
 def _read_kwargs():
     if USE_SHARED_DRIVES:
         return {"supportsAllDrives": True}
     return {}
 
+
 def _write_kwargs():
     if USE_SHARED_DRIVES:
         return {"supportsAllDrives": True}
     return {}
 
-# =========================
-# DRIVE HELPERS
-# =========================
+
 def _escape_drive_q_value(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def extract_slot_prefix(name: str) -> Optional[int]:
+    m = _SLOT_PREFIX_RE.match(name or "")
+    return int(m.group(1)) if m else None
+
 
 def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
@@ -186,11 +185,16 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
         if not page_token:
             break
 
+
 def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None):
+    matches = []
     for f in drive_list_children(service, parent_id, mime_type):
         if f.get("name") == name:
-            return f
-    return None
+            matches.append(f)
+    if not matches:
+        return None
+    return sorted(matches, key=lambda x: x.get("modifiedTime") or "", reverse=True)[0]
+
 
 def drive_get_file_meta(service, file_id: str):
     return execute_with_retries(
@@ -200,6 +204,7 @@ def drive_get_file_meta(service, file_id: str):
             **_read_kwargs(),
         )
     )
+
 
 def drive_download_file(service, file_id: str, dest_path: Path):
     request = service.files().get_media(fileId=file_id, **_read_kwargs())
@@ -220,6 +225,7 @@ def drive_download_file(service, file_id: str, dest_path: Path):
             if status:
                 print(f"      [DL  ] {int(status.progress() * 100)}%")
 
+
 def drive_upload_text(service, parent_id: str, filename: str, local_path: Path):
     existing = drive_find_child(service, parent_id, filename, None)
     media = MediaFileUpload(str(local_path), mimetype="text/plain", resumable=True)
@@ -229,6 +235,7 @@ def drive_upload_text(service, parent_id: str, filename: str, local_path: Path):
     else:
         meta = {"name": filename, "parents": [parent_id]}
         execute_with_retries(service.files().create(body=meta, media_body=media, fields="id", **_write_kwargs()))
+
 
 def drive_search_folder_anywhere_in_my_drive(service, folder_name: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
@@ -252,40 +259,50 @@ def drive_search_folder_anywhere_in_my_drive(service, folder_name: str) -> List[
             break
     return out
 
-# =========================
-# SLOT SELECTION
-# =========================
+
 def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
-    return sorted(list(drive_list_children(service, slots_parent_id, FOLDER_MIME)), key=lambda x: x["name"].lower())
+    folders = list(drive_list_children(service, slots_parent_id, FOLDER_MIME))
+    out = []
+
+    for f in folders:
+        slot_no = extract_slot_prefix(f.get("name", ""))
+        if slot_no is not None:
+            item = dict(f)
+            item["_slot_no"] = slot_no
+            out.append(item)
+
+    return sorted(out, key=lambda x: (x["_slot_no"], (x.get("name") or "").lower()))
+
 
 def choose_slot(service, slots_parent_id: str) -> dict:
     slots = list_slot_folders(service, slots_parent_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026.")
+        raise RuntimeError("No numbered slot folders found under 2026.")
 
     if SLOT_CHOICE_ENV.isdigit():
-        idx = int(SLOT_CHOICE_ENV)
-        if 1 <= idx <= len(slots):
-            chosen = slots[idx - 1]
-            print(f"[AUTO] Using SLOT_CHOICE={idx}: {chosen['name']}")
-            return chosen
-        raise RuntimeError(f"SLOT_CHOICE '{SLOT_CHOICE_ENV}' is out of range (1..{len(slots)}).")
+        wanted_slot_no = int(SLOT_CHOICE_ENV)
+        for s in slots:
+            if s["_slot_no"] == wanted_slot_no:
+                print(f"[AUTO] Using SLOT_CHOICE={wanted_slot_no}: {s['name']}")
+                return s
+        available = ", ".join(str(s["_slot_no"]) for s in slots)
+        raise RuntimeError(f"SLOT_CHOICE '{wanted_slot_no}' not found. Available folder numbers: {available}")
 
-    for i, s in enumerate(slots, start=1):
-        print(f"  {i:2}. {s['name']}")
+    for s in slots:
+        print(f"  {s['_slot_no']:2}. {s['name']}")
+
     while True:
-        choice = input("Choose slot number (e.g. 1) or EXIT: ").strip().lower()
+        choice = input("Choose slot number (e.g. 8 or 9) or EXIT: ").strip().lower()
         if choice == "exit":
             raise SystemExit(0)
         if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(slots):
-                return slots[idx - 1]
-        print(" Invalid choice. Try again.")
+            wanted_slot_no = int(choice)
+            for s in slots:
+                if s["_slot_no"] == wanted_slot_no:
+                    return s
+        print("Invalid choice. Try again.")
 
-# =========================
-# AUDIO HELPERS
-# =========================
+
 def is_video_name(name: str) -> bool:
     p = Path(name)
     if p.name.startswith("."):
@@ -295,6 +312,7 @@ def is_video_name(name: str) -> bool:
     if "__EYE_" in p.name:
         return False
     return True
+
 
 def extract_audio_wav(video_path: Path, wav_path: Path):
     proc = subprocess.run(
@@ -306,9 +324,11 @@ def extract_audio_wav(video_path: Path, wav_path: Path):
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed:\n{proc.stderr}")
 
+
 def wav_duration_seconds(wav_path: Path) -> float:
     with contextlib.closing(wave.open(str(wav_path), "rb")) as wf:
         return wf.getnframes() / float(wf.getframerate())
+
 
 def split_audio(wav_path: Path, chunk_seconds: int, overlap_seconds: int):
     total_seconds = wav_duration_seconds(wav_path)
@@ -334,14 +354,13 @@ def split_audio(wav_path: Path, chunk_seconds: int, overlap_seconds: int):
         idx += 1
     return chunks
 
+
 def fmt_ts(seconds: float) -> str:
     s = int(math.floor(seconds or 0.0))
     m, s = divmod(s, 60)
     return f"{m}:{s:02d}"
 
-# =========================
-# WHISPER
-# =========================
+
 def get_whisper_model():
     from faster_whisper import WhisperModel
     try:
@@ -351,6 +370,7 @@ def get_whisper_model():
             print(f"[WARN] CUDA failed ({e}). Falling back to CPU int8.")
             return WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
         raise
+
 
 def transcribe_with_faster_whisper(model, wav_path: Path) -> List[Tuple[float, str]]:
     lang = LANGUAGE if LANGUAGE else None
@@ -369,9 +389,7 @@ def transcribe_with_faster_whisper(model, wav_path: Path) -> List[Tuple[float, s
             out.append((start, text))
     return out
 
-# =========================
-# PROCESS ONE VIDEO
-# =========================
+
 def process_one_video(service, whisper_model, video_file_id: str, target_folder_id: str, video_name: str = ""):
     meta = drive_get_file_meta(service, video_file_id)
     video_name = video_name or meta["name"]
@@ -421,9 +439,7 @@ def process_one_video(service, whisper_model, video_file_id: str, target_folder_
         drive_upload_text(service, target_folder_id, out_txt_name, local_txt)
         print("[OK] done")
 
-# =========================
-# FULL SCAN MODE
-# =========================
+
 def main_full_scan():
     service = get_drive_service()
     whisper_model = get_whisper_model()
@@ -436,7 +452,7 @@ def main_full_scan():
     root_2026_id = candidates[0]["id"]
     slot = choose_slot(service, root_2026_id)
 
-    people = sorted(list(drive_list_children(service, slot["id"], FOLDER_MIME)), key=lambda x: x["name"])
+    people = sorted(list(drive_list_children(service, slot["id"], FOLDER_MIME)), key=lambda x: (x.get("name") or "").lower())
     for person in people:
         for folder_name in FOLDER_NAMES_TO_PROCESS:
             target = drive_find_child(service, person["id"], folder_name, FOLDER_MIME)
@@ -448,13 +464,10 @@ def main_full_scan():
             for vid in videos:
                 process_one_video(service, whisper_model, vid["id"], folder_id, vid["name"])
 
-# =========================
-# MAIN
-# =========================
+
 def main():
     subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-    # Validate single-video env vars
     if (VIDEO_FILE_ID and not TARGET_FOLDER_ID) or (TARGET_FOLDER_ID and not VIDEO_FILE_ID):
         raise RuntimeError("Both VIDEO_FILE_ID and TARGET_FOLDER_ID must be set for single-video mode.")
 
@@ -469,6 +482,7 @@ def main():
         return
 
     main_full_scan()
+
 
 if __name__ == "__main__":
     main()

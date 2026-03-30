@@ -19,14 +19,8 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 
-# =========================
-# LOAD ENV (.env)
-# =========================
 load_dotenv()
 
-# =========================
-# CONFIG
-# =========================
 ROOT_2026_FOLDER_NAME = (os.getenv("ROOT_2026_FOLDER_NAME") or "2026").strip()
 SHARED_DRIVE_NAME = (os.getenv("SHARED_DRIVE_NAME") or "").strip()
 
@@ -45,7 +39,6 @@ FOLDER_NAMES_TO_PROCESS = [
     "12. JD Video",
 ]
 
-# OpenAI Transcription
 MODEL = "gpt-4o-transcribe-diarize"
 LANGUAGE = "en"
 FORCE_RETRANSCRIBE = False
@@ -57,34 +50,29 @@ API_URL = "https://api.openai.com/v1/audio/transcriptions"
 
 TRANSCRIPT_SUFFIX = "_transcripts.txt"
 
-# Google Drive Auth - Service Account
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 SERVICE_ACCOUNT_FILE = Path((os.getenv("SERVICE_ACCOUNT_FILE") or "service-account.json").strip())
 AUTH_MODE = (os.getenv("AUTH_MODE") or "service_account").strip().lower()
 USE_DELEGATION = (os.getenv("USE_DELEGATION") or "").strip().lower() in ("1", "true", "yes", "y")
 DELEGATED_USER_EMAIL = (os.getenv("DELEGATED_USER_EMAIL") or "").strip()
 
-USE_SHARED_DRIVES = True  # forced true because this script is Shared-Drive-only
+USE_SHARED_DRIVES = True
 SLOT_CHOICE_ENV = (os.getenv("SLOT_CHOICE") or "").strip()
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
-# =========================
-# AUTH: OpenAI
-# =========================
 api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
 if not api_key:
     raise RuntimeError("OPENAI_API_KEY not set. Put it in .env as OPENAI_API_KEY=...")
 
-# =========================
-# WINDOWS-SAFE LOCAL FILENAMES
-# =========================
 _WINDOWS_FORBIDDEN = r'<>:"/\\|?*'
 _WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+
+_SLOT_PREFIX_RE = re.compile(r"^\s*(\d+)\.\s*")
 
 
 def safe_local_filename(name: str, fallback: str = "file.bin") -> str:
@@ -103,9 +91,6 @@ def transcript_output_name(video_name: str) -> str:
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
 
 
-# =========================
-# RETRY WRAPPER (Drive API)
-# =========================
 def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1.0):
     for attempt in range(max_retries):
         try:
@@ -122,9 +107,6 @@ def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1
             raise
 
 
-# =========================
-# Google Drive Auth (Service Account)
-# =========================
 def get_drive_service():
     if AUTH_MODE != "service_account":
         raise RuntimeError(f"Unsupported AUTH_MODE='{AUTH_MODE}'. Use AUTH_MODE=service_account")
@@ -151,9 +133,6 @@ def get_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-# =========================
-# Drive kwargs by operation
-# =========================
 def _list_kwargs_for_drive(drive_id: Optional[str] = None):
     kwargs = {
         "supportsAllDrives": True,
@@ -179,11 +158,13 @@ def _get_media_kwargs():
     }
 
 
-# =========================
-# Drive helpers
-# =========================
 def _escape_drive_q_value(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def extract_slot_prefix(name: str) -> Optional[int]:
+    m = _SLOT_PREFIX_RE.match(name or "")
+    return int(m.group(1)) if m else None
 
 
 def list_shared_drives(service) -> List[dict]:
@@ -323,51 +304,57 @@ def drive_search_folder_anywhere_in_shared_drive(service, folder_name: str, driv
     return out
 
 
-# =========================
-# SLOT SELECTION
-# =========================
 def list_slot_folders(service, slots_parent_id: str, drive_id: str) -> List[dict]:
-    return sorted(
-        list(drive_list_children(service, slots_parent_id, FOLDER_MIME, drive_id)),
-        key=lambda x: x["name"].lower(),
-    )
+    folders = list(drive_list_children(service, slots_parent_id, FOLDER_MIME, drive_id))
+    out = []
+
+    for f in folders:
+        slot_no = extract_slot_prefix(f.get("name", ""))
+        if slot_no is not None:
+            item = dict(f)
+            item["_slot_no"] = slot_no
+            out.append(item)
+
+    return sorted(out, key=lambda x: (x["_slot_no"], x["name"].lower()))
 
 
 def choose_slot(service, slots_parent_id: str, drive_id: str) -> dict:
     slots = list_slot_folders(service, slots_parent_id, drive_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026 inside the selected Shared Drive.")
+        raise RuntimeError("No numbered slot folders found under 2026 inside the selected Shared Drive.")
 
     if SLOT_CHOICE_ENV.isdigit():
-        idx = int(SLOT_CHOICE_ENV)
-        if 1 <= idx <= len(slots):
-            chosen = slots[idx - 1]
-            print(f"[AUTO] Using SLOT_CHOICE={idx}: {chosen['name']}")
-            return chosen
-        raise RuntimeError(f"SLOT_CHOICE '{SLOT_CHOICE_ENV}' is out of range (1..{len(slots)}).")
+        wanted_slot_no = int(SLOT_CHOICE_ENV)
+        for s in slots:
+            if s["_slot_no"] == wanted_slot_no:
+                print(f"[AUTO] Using SLOT_CHOICE={wanted_slot_no}: {s['name']}")
+                return s
+
+        available = ", ".join(str(s["_slot_no"]) for s in slots)
+        raise RuntimeError(
+            f"SLOT_CHOICE '{wanted_slot_no}' not found. Available folder numbers: {available}"
+        )
 
     print("\n" + "=" * 80)
     print("SELECT SLOT TO PROCESS")
     print("=" * 80)
 
-    for i, s in enumerate(slots, start=1):
-        print(f"  {i:2}. {s['name']}")
+    for s in slots:
+        print(f"  {s['_slot_no']:2}. {s['name']}")
     print("  EXIT - Exit\n")
 
     while True:
-        choice = input("Choose slot number (e.g. 1) or EXIT: ").strip().lower()
+        choice = input("Choose slot number (e.g. 8 or 9) or EXIT: ").strip().lower()
         if choice == "exit":
             raise SystemExit(0)
         if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(slots):
-                return slots[idx - 1]
+            wanted_slot_no = int(choice)
+            for s in slots:
+                if s["_slot_no"] == wanted_slot_no:
+                    return s
         print("Invalid choice. Try again.")
 
 
-# =========================
-# Audio helpers
-# =========================
 def is_video_name(name: str) -> bool:
     p = Path(name)
     if p.name.startswith("."):
@@ -428,9 +415,6 @@ def fmt_ts(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-# =========================
-# OpenAI helpers
-# =========================
 def pick_chunks(resp_json: dict):
     return resp_json.get("segments") or resp_json.get("chunks") or resp_json.get("results") or []
 
@@ -487,9 +471,6 @@ def transcribe_diarize_with_http(wav_path: Path, max_retries: int = 6) -> dict:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
 
 
-# =========================
-# MAIN
-# =========================
 def main():
     try:
         subprocess.run(

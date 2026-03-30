@@ -11,9 +11,6 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 
-# =========================
-# ENV
-# =========================
 load_dotenv()
 
 SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()
@@ -27,7 +24,6 @@ SHARED_DRIVE_NAME = (os.getenv("SHARED_DRIVE_NAME") or "").strip()
 ROOT_2026_FOLDER_NAME = (os.getenv("ROOT_2026_FOLDER_NAME") or "2026").strip()
 OUTPUT_ROOT_FOLDER_NAME = (os.getenv("OUTPUT_ROOT_FOLDER_NAME") or "Candidate Result").strip()
 
-# Optional exact IDs inside selected Shared Drive
 ROOT_2026_FOLDER_ID = (os.getenv("ROOT_2026_FOLDER_ID") or "").strip()
 OUTPUT_ROOT_FOLDER_ID = (os.getenv("OUTPUT_ROOT_FOLDER_ID") or "").strip()
 
@@ -35,9 +31,6 @@ SKIP_PERSON_FOLDERS = {
     x.strip() for x in (os.getenv("SKIP_PERSON_FOLDERS") or "1. Format").split(",") if x.strip()
 }
 
-# =========================
-# CONFIG
-# =========================
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/documents",
@@ -58,9 +51,9 @@ EDITOR_EMAILS = [
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 6
 
-# =========================
-# Retry helpers
-# =========================
+_SLOT_PREFIX_RE = re.compile(r"^\s*(\d+)\.\s*")
+
+
 def drive_execute(req, label: str = "Drive API call"):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -86,6 +79,7 @@ def drive_execute(req, label: str = "Drive API call"):
                 time.sleep(sleep_s)
                 continue
             raise
+
 
 def docs_execute(req, label: str = "Docs API call"):
     for attempt in range(1, MAX_RETRIES + 1):
@@ -113,9 +107,7 @@ def docs_execute(req, label: str = "Docs API call"):
                 continue
             raise
 
-# =========================
-# Auth
-# =========================
+
 def get_service_account_creds():
     if AUTH_MODE != "service_account":
         raise RuntimeError(f"Unsupported AUTH_MODE='{AUTH_MODE}'. Use AUTH_MODE=service_account")
@@ -141,15 +133,15 @@ def get_service_account_creds():
 
     return creds
 
+
 def get_drive_service(creds):
     return build("drive", "v3", credentials=creds)
+
 
 def get_docs_service(creds):
     return build("docs", "v1", credentials=creds)
 
-# =========================
-# Drive kwargs
-# =========================
+
 def _list_kwargs_for_drive(drive_id: Optional[str] = None) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
         "supportsAllDrives": True,
@@ -162,21 +154,23 @@ def _list_kwargs_for_drive(drive_id: Optional[str] = None) -> Dict[str, Any]:
         kwargs["corpora"] = "allDrives"
     return kwargs
 
+
 def _get_kwargs() -> Dict[str, Any]:
     return {"supportsAllDrives": True}
+
 
 def _write_kwargs() -> Dict[str, Any]:
     return {"supportsAllDrives": True}
 
-# =========================
-# Drive helpers
-# =========================
+
 def _escape_drive_q_value(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
-def _slot_sort_key(name: str):
-    m = re.search(r"(\d+)", name or "")
-    return (int(m.group(1)) if m else float("inf"), (name or "").lower())
+
+def extract_slot_prefix(name: str) -> Optional[int]:
+    m = _SLOT_PREFIX_RE.match(name or "")
+    return int(m.group(1)) if m else None
+
 
 def list_shared_drives(drive) -> List[dict]:
     out = []
@@ -195,6 +189,7 @@ def list_shared_drives(drive) -> List[dict]:
             break
     return out
 
+
 def get_shared_drive_by_name(drive, drive_name: str) -> dict:
     drives = list_shared_drives(drive)
     matches = [d for d in drives if d.get("name") == drive_name]
@@ -211,6 +206,7 @@ def get_shared_drive_by_name(drive, drive_name: str) -> dict:
 
     return matches[0]
 
+
 def drive_get_file(drive, file_id: str) -> dict:
     return drive_execute(
         drive.files().get(
@@ -220,6 +216,7 @@ def drive_get_file(drive, file_id: str) -> dict:
         ),
         label=f"get file {file_id}",
     )
+
 
 def drive_search_folder_anywhere_in_shared_drive(drive, folder_name: str, drive_id: str) -> List[dict]:
     safe = _escape_drive_q_value(folder_name)
@@ -244,8 +241,10 @@ def drive_search_folder_anywhere_in_shared_drive(drive, folder_name: str, drive_
             break
     return out
 
+
 def pick_best_named_folder(candidates: List[dict]) -> dict:
     return sorted(candidates, key=lambda c: c.get("modifiedTime") or "", reverse=True)[0]
+
 
 def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
@@ -273,6 +272,7 @@ def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None, 
         if not page_token:
             break
 
+
 def drive_find_children(
     drive,
     parent_id: str,
@@ -297,6 +297,7 @@ def drive_find_children(
     )
     return res.get("files", []) or []
 
+
 def drive_find_child(
     drive,
     parent_id: str,
@@ -309,11 +310,13 @@ def drive_find_child(
         return None
     return sorted(files, key=lambda f: f.get("modifiedTime") or "", reverse=True)[0]
 
+
 def drive_delete_file(drive, file_id: str):
     drive_execute(
         drive.files().delete(fileId=file_id, **_write_kwargs()),
         label=f"delete file {file_id}",
     )
+
 
 def drive_delete_all_named(
     drive,
@@ -327,6 +330,7 @@ def drive_delete_all_named(
         drive_delete_file(drive, f["id"])
     return len(matches)
 
+
 def drive_create_folder(drive, parent_id: str, name: str) -> str:
     meta = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
     created = drive_execute(
@@ -339,6 +343,7 @@ def drive_create_folder(drive, parent_id: str, name: str) -> str:
     )
     return created["id"]
 
+
 def drive_create_gdoc(drive, parent_id: str, name: str) -> str:
     meta = {"name": name, "mimeType": GDOC_MIME, "parents": [parent_id]}
     created = drive_execute(
@@ -350,6 +355,7 @@ def drive_create_gdoc(drive, parent_id: str, name: str) -> str:
         label=f"create gdoc '{name}'",
     )
     return created["id"]
+
 
 def drive_grant_editor_access(drive, file_id: str, emails: List[str]):
     for email in emails:
@@ -376,54 +382,61 @@ def drive_grant_editor_access(drive, file_id: str, emails: List[str]):
             else:
                 print(f"  [PERM] Failed for {email}: {e}")
 
-# =========================
-# SLOT SELECTION
-# =========================
+
 def list_slot_folders(drive, slots_parent_id: str, drive_id: str) -> List[dict]:
-    return sorted(
-        list(drive_list_children(drive, slots_parent_id, FOLDER_MIME, drive_id)),
-        key=lambda x: _slot_sort_key(x.get("name") or ""),
-    )
+    folders = list(drive_list_children(drive, slots_parent_id, FOLDER_MIME, drive_id))
+    out = []
+
+    for f in folders:
+        slot_no = extract_slot_prefix(f.get("name", ""))
+        if slot_no is not None:
+            item = dict(f)
+            item["_slot_no"] = slot_no
+            out.append(item)
+
+    return sorted(out, key=lambda x: (x["_slot_no"], (x.get("name") or "").lower()))
+
 
 def choose_slot(drive, slots_parent_id: str, drive_id: str) -> dict:
     slots = list_slot_folders(drive, slots_parent_id, drive_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026 inside the selected Shared Drive.")
+        raise RuntimeError("No numbered slot folders found under 2026 inside the selected Shared Drive.")
 
     if SLOT_CHOICE.isdigit():
-        idx = int(SLOT_CHOICE)
-        if 1 <= idx <= len(slots):
-            chosen = slots[idx - 1]
-            print(f"[AUTO] Using SLOT_CHOICE={idx}: {chosen['name']}")
-            return chosen
-        raise RuntimeError(f"SLOT_CHOICE='{SLOT_CHOICE}' out of range (1..{len(slots)}).")
+        wanted_slot_no = int(SLOT_CHOICE)
+        for s in slots:
+            if s["_slot_no"] == wanted_slot_no:
+                print(f"[AUTO] Using SLOT_CHOICE={wanted_slot_no}: {s['name']}")
+                return s
+        available = ", ".join(str(s["_slot_no"]) for s in slots)
+        raise RuntimeError(f"SLOT_CHOICE '{wanted_slot_no}' not found. Available folder numbers: {available}")
 
     print("\n" + "=" * 80)
     print("SELECT SLOT TO PROCESS")
     print("=" * 80)
 
-    for i, s in enumerate(slots, start=1):
-        print(f"  {i:2}. {s['name']}")
+    for s in slots:
+        print(f"  {s['_slot_no']:2}. {s['name']}")
     print("  EXIT - Exit\n")
 
     while True:
-        choice = input("Choose slot number (e.g. 1) or EXIT: ").strip().lower()
+        choice = input("Choose slot number (e.g. 8 or 9) or EXIT: ").strip().lower()
         if choice == "exit":
             raise SystemExit(0)
         if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(slots):
-                return slots[idx - 1]
+            wanted_slot_no = int(choice)
+            for s in slots:
+                if s["_slot_no"] == wanted_slot_no:
+                    return s
         print("Invalid choice. Try again.")
 
-# =========================
-# Docs helpers (tabs + text)
-# =========================
+
 def docs_get_document(docs, document_id: str) -> Dict[str, Any]:
     return docs_execute(
         docs.documents().get(documentId=document_id, includeTabsContent=True),
         label=f"get docs document {document_id}",
     )
+
 
 def flatten_tabs(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -436,6 +449,7 @@ def flatten_tabs(doc: Dict[str, Any]) -> List[Dict[str, Any]]:
     for t in doc.get("tabs", []) or []:
         rec(t)
     return out
+
 
 def read_structural_elements(elements: List[Dict[str, Any]]) -> str:
     parts: List[str] = []
@@ -455,6 +469,7 @@ def read_structural_elements(elements: List[Dict[str, Any]]) -> str:
             toc = el["tableOfContents"]
             parts.append(read_structural_elements(toc.get("content", [])))
     return "".join(parts)
+
 
 def extract_all_text_from_doc(docs, document_id: str) -> str:
     doc = docs_get_document(docs, document_id)
@@ -477,12 +492,14 @@ def extract_all_text_from_doc(docs, document_id: str) -> str:
         chunks.append(f"## {title}\n\n{txt}\n")
     return "\n\n".join(chunks).strip()
 
+
 def find_tab_id_by_title(doc: Dict[str, Any], title: str) -> Optional[str]:
     for t in flatten_tabs(doc):
         props = t.get("tabProperties") or {}
         if (props.get("title") or "") == title:
             return props.get("tabId")
     return None
+
 
 def get_first_tab_id(doc: Dict[str, Any]) -> str:
     tabs = flatten_tabs(doc)
@@ -493,6 +510,7 @@ def get_first_tab_id(doc: Dict[str, Any]) -> str:
         raise RuntimeError("First tab has no tabId (unexpected).")
     return tab_id
 
+
 def docs_batch_update(docs, document_id: str, requests: List[Dict[str, Any]]):
     return docs_execute(
         docs.documents().batchUpdate(
@@ -501,6 +519,7 @@ def docs_batch_update(docs, document_id: str, requests: List[Dict[str, Any]]):
         ),
         label=f"batch update doc {document_id}",
     )
+
 
 def set_tab_title(docs, document_id: str, tab_id: str, title: str):
     docs_batch_update(
@@ -516,6 +535,7 @@ def set_tab_title(docs, document_id: str, tab_id: str, title: str):
         ],
     )
 
+
 def add_tab(docs, document_id: str, title: str) -> str:
     docs_batch_update(
         docs,
@@ -527,6 +547,7 @@ def add_tab(docs, document_id: str, title: str) -> str:
     if not tab_id:
         raise RuntimeError(f"Created tab '{title}' but couldn't find its tabId.")
     return tab_id
+
 
 def insert_text_into_tab(docs, document_id: str, tab_id: str, text: str):
     docs_batch_update(
@@ -542,9 +563,7 @@ def insert_text_into_tab(docs, document_id: str, tab_id: str, text: str):
         ],
     )
 
-# =========================
-# MAIN
-# =========================
+
 def main():
     if not SHARED_DRIVE_NAME:
         raise RuntimeError("SHARED_DRIVE_NAME is required. Example: SHARED_DRIVE_NAME=2026_Shared_Drive")
@@ -563,7 +582,6 @@ def main():
 
     print(f"[INFO] Using Shared Drive: {shared_drive['name']} ({shared_drive_id})")
 
-    # --- SOURCE ROOT ---
     if ROOT_2026_FOLDER_ID:
         print(f"[ROOT] Using ROOT_2026_FOLDER_ID={ROOT_2026_FOLDER_ID}")
         base_2026 = drive_get_file(drive, ROOT_2026_FOLDER_ID)
@@ -594,7 +612,6 @@ def main():
         base_2026 = pick_best_named_folder(candidates_2026)
         print(f"[ROOT] Using source folder: {base_2026['name']} (id={base_2026['id']})")
 
-    # --- OUTPUT ROOT ---
     if OUTPUT_ROOT_FOLDER_ID:
         print(f"[ROOT] Using OUTPUT_ROOT_FOLDER_ID={OUTPUT_ROOT_FOLDER_ID}")
         output_root = drive_get_file(drive, OUTPUT_ROOT_FOLDER_ID)
@@ -626,12 +643,10 @@ def main():
         output_root = pick_best_named_folder(candidates_out)
         print(f"[ROOT] Using output folder: {output_root['name']} (id={output_root['id']})")
 
-    # --- SLOT ---
     slot = choose_slot(drive, base_2026["id"], shared_drive_id)
     slot_name = slot["name"]
     slot_id = slot["id"]
 
-    # --- Candidate Result/<SlotName> ---
     slot_output_folder = drive_find_child(drive, output_root["id"], slot_name, FOLDER_MIME, shared_drive_id)
     if not slot_output_folder:
         slot_output_folder_id = drive_create_folder(drive, output_root["id"], slot_name)
@@ -642,7 +657,6 @@ def main():
     print("[PERM] Setting folder editors...")
     drive_grant_editor_access(drive, slot_output_folder_id, EDITOR_EMAILS)
 
-    # --- Slot-level doc ---
     deleted = drive_delete_all_named(
         drive,
         slot_output_folder_id,
@@ -730,6 +744,7 @@ def main():
 
     print(f"[DONE] Slot '{slot_name}' updated.")
     print("Done.")
+
 
 if __name__ == "__main__":
     main()

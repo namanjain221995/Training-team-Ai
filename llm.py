@@ -17,9 +17,6 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 
-# ============================================================
-# ENV
-# ============================================================
 load_dotenv()
 
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
@@ -30,9 +27,6 @@ SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()
 MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-nano").strip()
 RERUN_FAILED_ONCE = (os.getenv("RERUN_FAILED_ONCE") or "true").strip().lower() in ("1", "true", "yes", "y")
 
-# ============================================================
-# AUTH / DRIVE CONFIG
-# ============================================================
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 SERVICE_ACCOUNT_FILE = Path((os.getenv("SERVICE_ACCOUNT_FILE") or "service-account.json").strip())
 AUTH_MODE = (os.getenv("AUTH_MODE") or "service_account").strip().lower()
@@ -45,16 +39,10 @@ ROOT_2026_FOLDER_NAME = (os.getenv("ROOT_2026_FOLDER_NAME") or "2026").strip()
 FOLDER_MIME = "application/vnd.google-apps.folder"
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 
-# ============================================================
-# CONFIG (Local Prompt Folder)
-# ============================================================
 PROMPT_DIR = Path("prompt")
 if not PROMPT_DIR.exists():
     raise FileNotFoundError("Local 'prompt/' folder not found. Put all prompts inside ./prompt/")
 
-# ============================================================
-# CONFIG (Prompts Mapping: Drive Folder -> Prompt File)
-# ============================================================
 FOLDER_TO_PROMPT = {
     "3. Introduction Video": "intro-prompt.txt",
     "4. Mock Interview (First Call)": "mock-prompt.txt",
@@ -84,9 +72,6 @@ PROMPT_NEEDS_PNG = {
     "System-design.txt",
 }
 
-# ============================================================
-# CONFIG (Reference PDFs)
-# ============================================================
 PDF_DIR = Path("pdf")
 if not PDF_DIR.exists():
     raise FileNotFoundError("Local 'pdf/' folder not found. Put reference PDFs inside ./pdf/")
@@ -99,30 +84,24 @@ if not NICHE_REFERENCE_PDF.exists():
 if not MOCK_REFERENCE_PDF.exists():
     raise FileNotFoundError("pdf/31-Questions.pdf not found (required for mock-prompt.txt).")
 
-# ============================================================
-# CONFIG (OpenAI)
-# ============================================================
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 OPENAI_FILES_URL = "https://api.openai.com/v1/files"
 OPENAI_FILE_PURPOSE = "user_data"
 MAX_TRANSCRIPT_CHARS = 250_000
 
-# ============================================================
-# MIME types
-# ============================================================
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 DOC_MIME = "application/msword"
 PDF_MIME = "application/pdf"
 
-# ============================================================
-# Windows-safe local filenames
-# ============================================================
 _WINDOWS_FORBIDDEN = r'<>:"/\\|?*'
 _WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+
+_SLOT_PREFIX_RE = re.compile(r"^\s*(\d+)\.\s*")
+
 
 def safe_local_filename(name: str, fallback: str = "file.txt") -> str:
     name = (name or "").strip() or fallback
@@ -136,9 +115,7 @@ def safe_local_filename(name: str, fallback: str = "file.txt") -> str:
     name = stem + (dot + ext if dot else "")
     return name or fallback
 
-# ============================================================
-# Retry helpers
-# ============================================================
+
 def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1.0):
     for attempt in range(max_retries):
         try:
@@ -153,6 +130,7 @@ def execute_with_retries(request, *, max_retries: int = 8, base_sleep: float = 1
                 time.sleep(sleep)
                 continue
             raise
+
 
 def request_with_retries(method, url, *, max_tries=6, base_sleep=1.0, **kwargs):
     last_exc = None
@@ -189,9 +167,7 @@ def request_with_retries(method, url, *, max_tries=6, base_sleep=1.0, **kwargs):
         raise last_exc
     raise RuntimeError("request_with_retries: exhausted retries with unknown error")
 
-# ============================================================
-# Google Drive Auth (Service Account)
-# ============================================================
+
 def get_drive_service():
     if AUTH_MODE != "service_account":
         raise RuntimeError(f"Unsupported AUTH_MODE='{AUTH_MODE}'. Use AUTH_MODE=service_account")
@@ -217,9 +193,7 @@ def get_drive_service():
 
     return build("drive", "v3", credentials=creds)
 
-# ============================================================
-# Drive kwargs by operation
-# ============================================================
+
 def _list_kwargs_for_drive(drive_id: Optional[str] = None):
     kwargs = {
         "supportsAllDrives": True,
@@ -232,17 +206,23 @@ def _list_kwargs_for_drive(drive_id: Optional[str] = None):
         kwargs["corpora"] = "allDrives"
     return kwargs
 
+
 def _write_kwargs():
     return {"supportsAllDrives": True}
+
 
 def _get_media_kwargs():
     return {"supportsAllDrives": True}
 
-# ============================================================
-# Drive helpers
-# ============================================================
+
 def _escape_drive_q_value(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def extract_slot_prefix(name: str) -> Optional[int]:
+    m = _SLOT_PREFIX_RE.match(name or "")
+    return int(m.group(1)) if m else None
+
 
 def list_shared_drives(service) -> List[dict]:
     out = []
@@ -260,6 +240,7 @@ def list_shared_drives(service) -> List[dict]:
             break
     return out
 
+
 def get_shared_drive_by_name(service, drive_name: str) -> dict:
     drives = list_shared_drives(service)
     matches = [d for d in drives if d.get("name") == drive_name]
@@ -275,6 +256,7 @@ def get_shared_drive_by_name(service, drive_name: str) -> dict:
         print(f"[WARN] Multiple Shared Drives named '{drive_name}'. Using first match.")
 
     return matches[0]
+
 
 def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
@@ -299,6 +281,7 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
         if not page_token:
             break
 
+
 def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     matches = []
     for f in drive_list_children(service, parent_id, mime_type, drive_id):
@@ -307,6 +290,7 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
     if not matches:
         return None
     return sorted(matches, key=lambda f: f.get("modifiedTime") or "", reverse=True)[0]
+
 
 def drive_download_file(service, file_id: str, dest_path: Path):
     request = service.files().get_media(fileId=file_id, **_get_media_kwargs())
@@ -323,6 +307,7 @@ def drive_download_file(service, file_id: str, dest_path: Path):
                     continue
                 raise
 
+
 def drive_export_google_doc_to_pdf(service, file_id: str, dest_path: Path):
     request = service.files().export_media(fileId=file_id, mimeType="application/pdf")
     with io.FileIO(str(dest_path), "wb") as fh:
@@ -330,6 +315,7 @@ def drive_export_google_doc_to_pdf(service, file_id: str, dest_path: Path):
         done = False
         while not done:
             _, done = downloader.next_chunk()
+
 
 def drive_export_google_doc_to_text(service, file_id: str, dest_path: Path):
     request = service.files().export_media(fileId=file_id, mimeType="text/plain")
@@ -339,12 +325,14 @@ def drive_export_google_doc_to_text(service, file_id: str, dest_path: Path):
         while not done:
             _, done = downloader.next_chunk()
 
+
 def drive_download_or_export_text(service, f: dict, dest_path: Path):
     mt = f.get("mimeType")
     if mt == GOOGLE_DOC_MIME:
         drive_export_google_doc_to_text(service, f["id"], dest_path)
     else:
         drive_download_file(service, f["id"], dest_path)
+
 
 def drive_upload_text_content(service, parent_id: str, filename: str, content: str, drive_id: Optional[str] = None):
     existing = drive_find_child(service, parent_id, filename, None, drive_id)
@@ -374,6 +362,7 @@ def drive_upload_text_content(service, parent_id: str, filename: str, content: s
             )
         )
 
+
 def drive_search_folder_anywhere_in_shared_drive(service, folder_name: str, drive_id: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
     q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed = false"
@@ -396,48 +385,57 @@ def drive_search_folder_anywhere_in_shared_drive(service, folder_name: str, driv
             break
     return out
 
-# ============================================================
-# SLOT SELECTION
-# ============================================================
+
 def list_slot_folders(service, slots_parent_id: str, drive_id: str) -> List[dict]:
-    return sorted(
-        list(drive_list_children(service, slots_parent_id, FOLDER_MIME, drive_id)),
-        key=lambda x: x["name"].lower()
-    )
+    folders = list(drive_list_children(service, slots_parent_id, FOLDER_MIME, drive_id))
+    out = []
+
+    for f in folders:
+        slot_no = extract_slot_prefix(f.get("name", ""))
+        if slot_no is not None:
+            item = dict(f)
+            item["_slot_no"] = slot_no
+            out.append(item)
+
+    return sorted(out, key=lambda x: (x["_slot_no"], x["name"].lower()))
+
 
 def choose_slot(service, slots_parent_id: str, drive_id: str) -> dict:
     slots = list_slot_folders(service, slots_parent_id, drive_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026 inside the selected Shared Drive.")
+        raise RuntimeError("No numbered slot folders found under 2026 inside the selected Shared Drive.")
 
     if SLOT_CHOICE.isdigit():
-        idx = int(SLOT_CHOICE)
-        if 1 <= idx <= len(slots):
-            chosen = slots[idx - 1]
-            print(f"[AUTO] Using SLOT_CHOICE={idx}: {chosen['name']}")
-            return chosen
-        raise RuntimeError(f"SLOT_CHOICE='{SLOT_CHOICE}' out of range (1..{len(slots)}).")
+        wanted_slot_no = int(SLOT_CHOICE)
+        for s in slots:
+            if s["_slot_no"] == wanted_slot_no:
+                print(f"[AUTO] Using SLOT_CHOICE={wanted_slot_no}: {s['name']}")
+                return s
+
+        available = ", ".join(str(s["_slot_no"]) for s in slots)
+        raise RuntimeError(
+            f"SLOT_CHOICE '{wanted_slot_no}' not found. Available folder numbers: {available}"
+        )
 
     print("\n" + "=" * 80)
     print("SELECT SLOT TO PROCESS")
     print("=" * 80)
-    for i, s in enumerate(slots, start=1):
-        print(f"  {i:2}. {s['name']}")
+    for s in slots:
+        print(f"  {s['_slot_no']:2}. {s['name']}")
     print("  EXIT - Exit\n")
 
     while True:
-        choice = input("Choose slot number (e.g. 1) or EXIT: ").strip().lower()
+        choice = input("Choose slot number (e.g. 8 or 9) or EXIT: ").strip().lower()
         if choice == "exit":
             raise SystemExit(0)
         if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(slots):
-                return slots[idx - 1]
+            wanted_slot_no = int(choice)
+            for s in slots:
+                if s["_slot_no"] == wanted_slot_no:
+                    return s
         print("Invalid choice. Try again.")
 
-# ============================================================
-# Convert Office (DOCX/DOC) -> PDF via Google
-# ============================================================
+
 def drive_convert_office_to_pdf_via_google(service, office_file_id: str, dest_pdf_path: Path) -> None:
     body = {"name": f"__TEMP_CONVERT__{office_file_id}", "mimeType": GOOGLE_DOC_MIME}
     temp = execute_with_retries(
@@ -458,12 +456,11 @@ def drive_convert_office_to_pdf_via_google(service, office_file_id: str, dest_pd
         except Exception:
             pass
 
-# ============================================================
-# Resume discovery
-# ============================================================
+
 def is_resume_like(name: str) -> bool:
     n = name.lower()
     return ("resume" in n) or ("cv" in n)
+
 
 def find_candidate_resume_file(service, person_folder_id: str, drive_id: str) -> Optional[dict]:
     files = list(drive_list_children(service, person_folder_id, None, drive_id))
@@ -490,9 +487,7 @@ def find_candidate_resume_file(service, person_folder_id: str, drive_id: str) ->
 
     return None
 
-# ============================================================
-# Transcript aggregation
-# ============================================================
+
 def read_all_transcripts_in_folder(service, transcript_folder_id: str, folder_name: str, drive_id: str) -> str:
     txts: List[dict] = []
 
@@ -537,6 +532,7 @@ def read_all_transcripts_in_folder(service, transcript_folder_id: str, folder_na
         combined = combined[:MAX_TRANSCRIPT_CHARS] + "\n\n[TRUNCATED DUE TO SIZE LIMIT]\n"
     return combined
 
+
 def download_pngs_in_folder(service, folder_id: str, temp_dir: Path, drive_id: str) -> List[Path]:
     png_paths: List[Path] = []
     for f in drive_list_children(service, folder_id, None, drive_id):
@@ -556,15 +552,14 @@ def download_pngs_in_folder(service, folder_id: str, temp_dir: Path, drive_id: s
     png_paths.sort(key=lambda p: p.name.lower())
     return png_paths
 
-# ============================================================
-# OpenAI helpers
-# ============================================================
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
 
 class OpenAIFileCache:
     def __init__(self, cache_path: Path = Path(".openai_file_cache.json")):
@@ -582,6 +577,7 @@ class OpenAIFileCache:
     def set(self, digest: str, file_id: str):
         self.data[digest] = file_id
         self.cache_path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+
 
 def openai_upload_file(path: Path, mime: str, cache: OpenAIFileCache) -> str:
     digest = sha256_file(path)
@@ -609,8 +605,10 @@ def openai_upload_file(path: Path, mime: str, cache: OpenAIFileCache) -> str:
     cache.set(digest, file_id)
     return file_id
 
+
 def openai_upload_pdf(path: Path, cache: OpenAIFileCache) -> str:
     return openai_upload_file(path, "application/pdf", cache)
+
 
 def png_to_input_image_part(png_path: Path) -> dict:
     b64 = base64.b64encode(png_path.read_bytes()).decode("utf-8")
@@ -618,6 +616,7 @@ def png_to_input_image_part(png_path: Path) -> dict:
         "type": "input_image",
         "image_url": f"data:image/png;base64,{b64}",
     }
+
 
 def openai_run_prompt(
     prompt_text: str,
@@ -668,9 +667,7 @@ def openai_run_prompt(
         final = json.dumps(resp, indent=2)
     return final
 
-# ============================================================
-# MAIN
-# ============================================================
+
 def main():
     if not SHARED_DRIVE_NAME:
         raise RuntimeError("SHARED_DRIVE_NAME is required. Example: SHARED_DRIVE_NAME=2026_Shared_Drive")
@@ -923,6 +920,7 @@ def main():
 
             except Exception as e:
                 print(f"[RERUN][FAIL] {person_name}/{folder_name}: {type(e).__name__}: {e}")
+
 
 if __name__ == "__main__":
     main()

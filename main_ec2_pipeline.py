@@ -15,9 +15,6 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
-# -----------------------------
-# CONFIG (orchestrator container)
-# -----------------------------
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 LAUNCH_TEMPLATE_ID = os.getenv("WORKER_LAUNCH_TEMPLATE_ID", "").strip()
@@ -27,7 +24,7 @@ ROOT_2026_FOLDER_NAME = os.getenv("ROOT_2026_FOLDER_NAME", "2026").strip()
 ROOT_2026_FOLDER_ID = os.getenv("ROOT_2026_FOLDER_ID", "").strip()
 SHARED_DRIVE_NAME = os.getenv("SHARED_DRIVE_NAME", "").strip()
 
-SLOT_CHOICE = os.getenv("SLOT_CHOICE", "").strip()  # 1-based index
+SLOT_CHOICE = os.getenv("SLOT_CHOICE", "").strip()
 
 AUTH_MODE = os.getenv("AUTH_MODE", "service_account").strip().lower()
 USE_DELEGATION = os.getenv("USE_DELEGATION", "1").strip().lower() in ("1", "true", "yes", "y")
@@ -51,34 +48,26 @@ FOLDER_NAMES_TO_PROCESS = [
     "12. JD Video",
 ]
 
-# Launch behavior
-MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "0"))  # 0 = no cap on total tasks selected
+MAX_LAUNCH = int(os.getenv("MAX_LAUNCH", "0"))
 MAX_CONCURRENT_WORKERS = int(os.getenv("MAX_CONCURRENT_WORKERS", "16"))
 LAUNCH_SLEEP_SECONDS = float(os.getenv("LAUNCH_SLEEP_SECONDS", "0.10"))
 
-# Wait behavior
 WAIT_POLL_SECONDS = int(os.getenv("WAIT_POLL_SECONDS", "15"))
 
-# Unique RunId tag for this run
 RUN_ID = os.getenv("RUN_ID", "") or time.strftime("%Y%m%d_%H%M%S")
 
-# Drive flakiness -> retries
 GOOGLE_PAGE_SIZE = int(os.getenv("GOOGLE_PAGE_SIZE", "500"))
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = int(os.getenv("GOOGLE_EXECUTE_RETRIES", "8"))
 
-# Worker SSM parameter names
 SSM_ENV_PARAM = os.getenv("SSM_ENV_PARAM", "/transcription/worker/env")
 SSM_SERVICE_ACCOUNT_PARAM = os.getenv("SSM_SERVICE_ACCOUNT_PARAM", "/transcription/worker/service_account_json")
 
-# CloudWatch group for docker logs (awslogs driver)
 WORKER_LOG_GROUP = os.getenv("WORKER_LOG_GROUP", "/transcription/workers")
 
-# Worker image in ECR
 WORKER_ECR_REPO = os.getenv("WORKER_ECR_REPO", "transcription-worker").strip()
 WORKER_IMAGE_TAG = os.getenv("WORKER_IMAGE_TAG", "latest").strip()
 
-# Worker whisper defaults
 WORKER_WHISPER_MODEL = os.getenv("WORKER_WHISPER_MODEL", "turbo").strip()
 WORKER_DEVICE = os.getenv("WORKER_DEVICE", "cpu").strip()
 WORKER_COMPUTE_TYPE = os.getenv("WORKER_COMPUTE_TYPE", "int8").strip()
@@ -87,20 +76,16 @@ WORKER_USE_VAD = os.getenv("WORKER_USE_VAD", "true").strip().lower()
 WORKER_CHUNK_SECONDS = os.getenv("WORKER_CHUNK_SECONDS", "540").strip()
 WORKER_OVERLAP_SECONDS = os.getenv("WORKER_OVERLAP_SECONDS", "2").strip()
 
-# Worker termination model
 USE_SHUTDOWN_TERMINATE = os.getenv("USE_SHUTDOWN_TERMINATE", "1").strip().lower() in ("1", "true", "yes", "y")
 
-# -----------------------------
-# AWS clients
-# -----------------------------
 ec2 = boto3.client("ec2", region_name=AWS_REGION)
 sts = boto3.client("sts", region_name=AWS_REGION)
 ssm = boto3.client("ssm", region_name=AWS_REGION)
 AWS_ACCOUNT_ID = os.getenv("AWS_ACCOUNT_ID", "").strip() or sts.get_caller_identity()["Account"]
 
-# -----------------------------
-# Retry helpers
-# -----------------------------
+_SLOT_PREFIX_RE = re.compile(r"^\s*(\d+)\.\s*")
+
+
 def drive_execute(req, label: str = "Drive API call"):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -121,21 +106,18 @@ def drive_execute(req, label: str = "Drive API call"):
                 continue
             raise
 
-# -----------------------------
-# SSM helpers
-# -----------------------------
+
 def ssm_get(name: str, with_decryption: bool = True) -> str:
     resp = ssm.get_parameter(Name=name, WithDecryption=with_decryption)
     return resp["Parameter"]["Value"]
 
-# -----------------------------
-# Drive auth (service account + delegation)
-# -----------------------------
+
 def parse_service_account_json(text: str) -> Dict[str, Any]:
     try:
         return json.loads(text)
     except Exception as e:
         raise RuntimeError(f"Invalid service account JSON from SSM: {e}")
+
 
 def build_drive(service_account_json_text: str):
     if AUTH_MODE != "service_account":
@@ -156,15 +138,15 @@ def build_drive(service_account_json_text: str):
 
     return build("drive", "v3", credentials=creds)
 
-# -----------------------------
-# Drive helpers
-# -----------------------------
+
 def _escape_drive_q_value(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
-def _slot_sort_key(name: str):
-    m = re.search(r"(\d+)", name or "")
-    return (int(m.group(1)) if m else float("inf"), (name or "").lower())
+
+def extract_slot_prefix(name: str) -> Optional[int]:
+    m = _SLOT_PREFIX_RE.match(name or "")
+    return int(m.group(1)) if m else None
+
 
 def _list_kwargs_for_drive(drive_id: Optional[str] = None) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
@@ -178,8 +160,10 @@ def _list_kwargs_for_drive(drive_id: Optional[str] = None) -> Dict[str, Any]:
         kwargs["corpora"] = "allDrives"
     return kwargs
 
+
 def _get_kwargs() -> Dict[str, Any]:
     return {"supportsAllDrives": True}
+
 
 def list_shared_drives(drive) -> List[dict]:
     out: List[dict] = []
@@ -194,6 +178,7 @@ def list_shared_drives(drive) -> List[dict]:
         if not token:
             break
     return out
+
 
 def get_shared_drive_by_name(drive, drive_name: str) -> dict:
     drives = list_shared_drives(drive)
@@ -211,6 +196,7 @@ def get_shared_drive_by_name(drive, drive_name: str) -> dict:
 
     return matches[0]
 
+
 def drive_get_file(drive, file_id: str) -> dict:
     return drive_execute(
         drive.files().get(
@@ -220,6 +206,7 @@ def drive_get_file(drive, file_id: str) -> dict:
         ),
         label=f"get file {file_id}",
     )
+
 
 def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
@@ -244,6 +231,7 @@ def drive_list_children(drive, parent_id: str, mime_type: Optional[str] = None, 
         if not token:
             break
 
+
 def drive_find_child(drive, parent_id: str, name: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     safe_name = _escape_drive_q_value(name)
     q_parts = [f"'{parent_id}' in parents", "trashed = false", f"name = '{safe_name}'"]
@@ -264,6 +252,7 @@ def drive_find_child(drive, parent_id: str, name: str, mime_type: Optional[str] 
     if not files:
         return None
     return sorted(files, key=lambda x: x.get("modifiedTime") or "", reverse=True)[0]
+
 
 def drive_search_folder_anywhere_in_shared_drive(drive, folder_name: str, drive_id: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
@@ -288,6 +277,7 @@ def drive_search_folder_anywhere_in_shared_drive(drive, folder_name: str, drive_
             break
     return out
 
+
 def is_video(name: str) -> bool:
     p = Path(name)
     if p.name.startswith("."):
@@ -298,24 +288,45 @@ def is_video(name: str) -> bool:
         return False
     return True
 
+
 def transcript_name(video_name: str) -> str:
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
 
+
+def list_slot_folders(drive, root_id: str, drive_id: str) -> List[dict]:
+    folders = list(drive_list_children(drive, root_id, FOLDER_MIME, drive_id))
+    out = []
+
+    for f in folders:
+        slot_no = extract_slot_prefix(f.get("name", ""))
+        if slot_no is not None:
+            item = dict(f)
+            item["_slot_no"] = slot_no
+            out.append(item)
+
+    return sorted(out, key=lambda x: (x["_slot_no"], x.get("name", "").lower()))
+
+
 def pick_slot(drive, root_id: str, drive_id: str) -> dict:
-    slots = sorted(
-        list(drive_list_children(drive, root_id, FOLDER_MIME, drive_id)),
-        key=lambda x: _slot_sort_key(x.get("name") or ""),
-    )
+    slots = list_slot_folders(drive, root_id, drive_id)
     if not slots:
-        raise RuntimeError("No slot folders found under 2026.")
+        raise RuntimeError("No numbered slot folders found under 2026.")
 
     if SLOT_CHOICE.isdigit():
-        idx = int(SLOT_CHOICE)
-        if not (1 <= idx <= len(slots)):
-            raise RuntimeError(f"SLOT_CHOICE out of range (1..{len(slots)})")
-        return slots[idx - 1]
+        wanted_slot_no = int(SLOT_CHOICE)
+        for s in slots:
+            if s["_slot_no"] == wanted_slot_no:
+                print(f"[AUTO] Using SLOT_CHOICE={wanted_slot_no}: {s['name']}")
+                return s
 
+        available = ", ".join(str(s["_slot_no"]) for s in slots)
+        raise RuntimeError(
+            f"SLOT_CHOICE '{wanted_slot_no}' not found. Available folder numbers: {available}"
+        )
+
+    print("[INFO] SLOT_CHOICE not set. Defaulting to lowest numbered folder.")
     return slots[0]
+
 
 def find_tasks(drive) -> List[Dict[str, str]]:
     if not SHARED_DRIVE_NAME:
@@ -345,6 +356,8 @@ def find_tasks(drive) -> List[Dict[str, str]]:
         root = roots[0]
 
     slot = pick_slot(drive, root["id"], shared_drive_id)
+    print(f"[SELECTED] Slot: {slot['name']}")
+
     people = sorted(
         list(drive_list_children(drive, slot["id"], FOLDER_MIME, shared_drive_id)),
         key=lambda x: x["name"].lower(),
@@ -379,6 +392,7 @@ def find_tasks(drive) -> List[Dict[str, str]]:
 
     return tasks
 
+
 def _sanitize_stream_name(s: str) -> str:
     s = s.replace("/", "_").replace("\\", "_").replace(":", "_")
     s = s.replace("\n", " ").replace("\r", " ")
@@ -387,9 +401,7 @@ def _sanitize_stream_name(s: str) -> str:
         s = s[:200]
     return s or "video"
 
-# -----------------------------
-# WORKER USERDATA
-# -----------------------------
+
 WORKER_USERDATA_TEMPLATE = r"""#!/bin/bash
 set -euo pipefail
 
@@ -401,10 +413,8 @@ exec > >(tee -a /var/log/worker-userdata.log) 2>&1
 echo "[BOOT] Worker starting..."
 date
 
-# Always shutdown on exit
 {EXIT_TRAP}
 
-# IMDSv2
 TOKEN="$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)"
 imds() {{
   local p="$1"
@@ -474,9 +484,7 @@ set -e
 echo "[BOOT] Done."
 """
 
-# -----------------------------
-# Worker launch / state helpers
-# -----------------------------
+
 def launch_one_worker(task: Dict[str, str]) -> str:
     stream = _sanitize_stream_name(task["video_name"])
     log_stream = f"{RUN_ID}/{stream}"
@@ -544,6 +552,7 @@ def launch_one_worker(task: Dict[str, str]) -> str:
                 continue
             raise
 
+
 def describe_run_workers() -> List[Dict[str, str]]:
     resp = ec2.describe_instances(
         Filters=[
@@ -564,14 +573,13 @@ def describe_run_workers() -> List[Dict[str, str]]:
             )
     return workers
 
+
 def list_active_workers() -> List[str]:
     workers = describe_run_workers()
     active_states = {"pending", "running", "stopping", "shutting-down"}
     return [w["instance_id"] for w in workers if w["state"] in active_states]
 
-# -----------------------------
-# Main orchestration loop
-# -----------------------------
+
 def main():
     if not LAUNCH_TEMPLATE_ID:
         raise RuntimeError("WORKER_LAUNCH_TEMPLATE_ID not set in .env (orchestrator container).")
@@ -582,7 +590,7 @@ def main():
     if MAX_CONCURRENT_WORKERS < 1:
         raise RuntimeError("MAX_CONCURRENT_WORKERS must be >= 1")
 
-    print(f"[RUN] RUN_ID={RUN_ID} SLOT_CHOICE={SLOT_CHOICE or '1(default)'}")
+    print(f"[RUN] RUN_ID={RUN_ID} SLOT_CHOICE={SLOT_CHOICE or 'not set'}")
     print(f"[RUN] MAX_CONCURRENT_WORKERS={MAX_CONCURRENT_WORKERS}")
 
     service_account_json_text = ssm_get(SSM_SERVICE_ACCOUNT_PARAM, with_decryption=True)
@@ -634,6 +642,7 @@ def main():
         time.sleep(WAIT_POLL_SECONDS)
 
     print("[DONE] All workers completed ✅ (orchestrator exiting)")
+
 
 if __name__ == "__main__":
     main()

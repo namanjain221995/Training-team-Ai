@@ -21,9 +21,6 @@ from google.oauth2 import service_account
 
 from openai import OpenAI
 
-# =========================
-# ENV
-# =========================
 load_dotenv()
 
 SLOT_CHOICE = (os.getenv("SLOT_CHOICE") or "").strip()
@@ -38,13 +35,9 @@ SHARED_DRIVE_NAME = (os.getenv("SHARED_DRIVE_NAME") or "").strip()
 ROOT_2026_FOLDER_NAME = (os.getenv("ROOT_2026_FOLDER_NAME") or "2026").strip()
 OUTPUT_ROOT_FOLDER_NAME = (os.getenv("OUTPUT_ROOT_FOLDER_NAME") or "Candidate Result").strip()
 
-# Optional exact IDs inside selected Shared Drive
 ROOT_2026_FOLDER_ID = (os.getenv("ROOT_2026_FOLDER_ID") or "").strip()
 OUTPUT_ROOT_FOLDER_ID = (os.getenv("OUTPUT_ROOT_FOLDER_ID") or "").strip()
 
-# =========================
-# CONFIG
-# =========================
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -115,9 +108,9 @@ GREEN_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="so
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 6
 
-# =========================
-# Retry helpers
-# =========================
+_SLOT_PREFIX_RE = re.compile(r"^\s*(\d+)\.\s*")
+
+
 def drive_execute(req, label: str = "Drive API call"):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -144,14 +137,13 @@ def drive_execute(req, label: str = "Drive API call"):
                 continue
             raise
 
-# =========================
-# OpenAI
-# =========================
+
 def init_openai_client() -> OpenAI:
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not found in .env or environment variables.")
     return OpenAI(api_key=api_key)
+
 
 def safe_response_output_text(resp) -> str:
     if hasattr(resp, "output_text") and resp.output_text:
@@ -166,9 +158,7 @@ def safe_response_output_text(resp) -> str:
                 parts.append(t)
     return "\n".join(parts).strip()
 
-# =========================
-# Drive auth
-# =========================
+
 def get_drive_service():
     if AUTH_MODE != "service_account":
         raise RuntimeError(f"Unsupported AUTH_MODE='{AUTH_MODE}'. Use AUTH_MODE=service_account")
@@ -194,9 +184,7 @@ def get_drive_service():
 
     return build("drive", "v3", credentials=creds)
 
-# =========================
-# Shared Drive kwargs
-# =========================
+
 def _list_kwargs_for_drive(drive_id: Optional[str] = None) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
         "supportsAllDrives": True,
@@ -209,21 +197,23 @@ def _list_kwargs_for_drive(drive_id: Optional[str] = None) -> Dict[str, Any]:
         kwargs["corpora"] = "allDrives"
     return kwargs
 
+
 def _kwargs_for_mutation() -> Dict[str, Any]:
     return {"supportsAllDrives": True}
+
 
 def _get_media_kwargs() -> Dict[str, Any]:
     return {"supportsAllDrives": True}
 
-# =========================
-# Drive helpers
-# =========================
+
 def _escape_drive_q_value(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
-def _slot_sort_key(name: str):
-    m = re.search(r"(\d+)", name or "")
-    return (int(m.group(1)) if m else float("inf"), (name or "").lower())
+
+def extract_slot_prefix(name: str) -> Optional[int]:
+    m = _SLOT_PREFIX_RE.match(name or "")
+    return int(m.group(1)) if m else None
+
 
 def list_shared_drives(service) -> List[dict]:
     out = []
@@ -242,6 +232,7 @@ def list_shared_drives(service) -> List[dict]:
             break
     return out
 
+
 def get_shared_drive_by_name(service, drive_name: str) -> dict:
     drives = list_shared_drives(service)
     matches = [d for d in drives if d.get("name") == drive_name]
@@ -258,6 +249,7 @@ def get_shared_drive_by_name(service, drive_name: str) -> dict:
 
     return matches[0]
 
+
 def drive_get_file(service, file_id: str) -> dict:
     return drive_execute(
         service.files().get(
@@ -267,6 +259,7 @@ def drive_get_file(service, file_id: str) -> dict:
         ),
         label=f"get file {file_id}",
     )
+
 
 def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
@@ -291,6 +284,7 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
         page_token = res.get("nextPageToken")
         if not page_token:
             break
+
 
 def drive_find_child(
     service,
@@ -319,6 +313,7 @@ def drive_find_child(
         return None
     return sorted(files, key=lambda f: f.get("modifiedTime") or "", reverse=True)[0]
 
+
 def drive_create_folder(service, parent_id: str, name: str) -> str:
     meta = {"name": name, "mimeType": FOLDER_MIME, "parents": [parent_id]}
     created = drive_execute(
@@ -330,6 +325,7 @@ def drive_create_folder(service, parent_id: str, name: str) -> str:
         label=f"create folder '{name}'",
     )
     return created["id"]
+
 
 def drive_download_text(service, file_id: str, mime_type: Optional[str]) -> str:
     fh = io.BytesIO()
@@ -353,6 +349,7 @@ def drive_download_text(service, file_id: str, mime_type: Optional[str]) -> str:
         return raw.decode("utf-8")
     except Exception:
         return raw.decode("latin-1", errors="ignore")
+
 
 def drive_upload_xlsx(service, parent_id: str, filename: str, local_path: Path, drive_id: Optional[str] = None) -> str:
     matches = [
@@ -388,6 +385,7 @@ def drive_upload_xlsx(service, parent_id: str, filename: str, local_path: Path, 
         )
         return created["id"]
 
+
 def drive_search_folder_anywhere_in_shared_drive(service, folder_name: str, drive_id: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
     q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed = false"
@@ -411,8 +409,10 @@ def drive_search_folder_anywhere_in_shared_drive(service, folder_name: str, driv
             break
     return out
 
+
 def pick_best_named_folder(candidates: List[dict]) -> dict:
     return sorted(candidates, key=lambda c: (c.get("modifiedTime") or ""), reverse=True)[0]
+
 
 def drive_grant_editor_access(service, file_id: str, emails: List[str]):
     for email in emails:
@@ -436,54 +436,61 @@ def drive_grant_editor_access(service, file_id: str, emails: List[str]):
                 print(f"  [PERM] Failed for {email}: {e}")
         time.sleep(0.08)
 
-# =========================
-# SLOT SELECTION
-# =========================
+
 def list_slot_folders(service, slots_parent_id: str, drive_id: str) -> List[dict]:
-    return sorted(
-        list(drive_list_children(service, slots_parent_id, FOLDER_MIME, drive_id)),
-        key=lambda x: _slot_sort_key(x.get("name") or ""),
-    )
+    folders = list(drive_list_children(service, slots_parent_id, FOLDER_MIME, drive_id))
+    out = []
+
+    for f in folders:
+        slot_no = extract_slot_prefix(f.get("name", ""))
+        if slot_no is not None:
+            item = dict(f)
+            item["_slot_no"] = slot_no
+            out.append(item)
+
+    return sorted(out, key=lambda x: (x["_slot_no"], (x.get("name") or "").lower()))
+
 
 def choose_slot(service, slots_parent_id: str, drive_id: str) -> dict:
     slots = list_slot_folders(service, slots_parent_id, drive_id)
     if not slots:
-        raise RuntimeError(f"No slot folders found under '{ROOT_2026_FOLDER_NAME}' inside the selected Shared Drive.")
+        raise RuntimeError(f"No numbered slot folders found under '{ROOT_2026_FOLDER_NAME}' inside the selected Shared Drive.")
 
     if SLOT_CHOICE.isdigit():
-        idx = int(SLOT_CHOICE)
-        if 1 <= idx <= len(slots):
-            chosen = slots[idx - 1]
-            print(f"[AUTO] Using SLOT_CHOICE={idx}: {chosen['name']}")
-            return chosen
-        raise RuntimeError(f"SLOT_CHOICE='{SLOT_CHOICE}' out of range (1..{len(slots)}).")
+        wanted_slot_no = int(SLOT_CHOICE)
+        for s in slots:
+            if s["_slot_no"] == wanted_slot_no:
+                print(f"[AUTO] Using SLOT_CHOICE={wanted_slot_no}: {s['name']}")
+                return s
+        available = ", ".join(str(s["_slot_no"]) for s in slots)
+        raise RuntimeError(f"SLOT_CHOICE '{wanted_slot_no}' not found. Available folder numbers: {available}")
 
     print("\n" + "=" * 80)
     print("SELECT SLOT TO PROCESS")
     print("=" * 80)
-    for i, s in enumerate(slots, start=1):
-        print(f"  {i:2}. {s['name']}")
+    for s in slots:
+        print(f"  {s['_slot_no']:2}. {s['name']}")
     print("  EXIT - Exit\n")
 
     while True:
-        choice = input("Choose slot number (e.g. 1) or EXIT: ").strip().lower()
+        choice = input("Choose slot number (e.g. 8 or 9) or EXIT: ").strip().lower()
         if choice == "exit":
             raise SystemExit(0)
         if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(slots):
-                return slots[idx - 1]
+            wanted_slot_no = int(choice)
+            for s in slots:
+                if s["_slot_no"] == wanted_slot_no:
+                    return s
         print("Invalid choice. Try again.")
 
-# =========================
-# Score extraction -> PERCENT
-# =========================
+
 def clamp_pct(x: Optional[float]) -> Optional[float]:
     if x is None:
         return None
     if x < PCT_MIN or x > PCT_MAX:
         return None
     return x
+
 
 def normalize_to_percent(value: float, unit: Optional[str]) -> Optional[float]:
     u = (unit or "").lower().strip()
@@ -498,6 +505,7 @@ def normalize_to_percent(value: float, unit: Optional[str]) -> Optional[float]:
     if 10.0 < value <= 100.0:
         return value
     return None
+
 
 def extract_score_regex_percent(text: str) -> Optional[float]:
     if not text:
@@ -523,6 +531,7 @@ def extract_score_regex_percent(text: str) -> Optional[float]:
                 return None
 
     return None
+
 
 def extract_score_openai_percent(client: OpenAI, text: str) -> Optional[float]:
     if not text:
@@ -588,6 +597,7 @@ def extract_score_openai_percent(client: OpenAI, text: str) -> Optional[float]:
     pct = normalize_to_percent(val, unit_hint)
     return clamp_pct(round(pct, 2)) if pct is not None else None
 
+
 def pick_best_score_from_llm_outputs_percent(
     service,
     openai_client: OpenAI,
@@ -615,9 +625,7 @@ def pick_best_score_from_llm_outputs_percent(
 
     return None, None
 
-# =========================
-# Excel creation
-# =========================
+
 def autosize_columns(ws):
     for col in ws.columns:
         max_len = 0
@@ -627,6 +635,7 @@ def autosize_columns(ws):
             max_len = max(max_len, len(v))
         ws.column_dimensions[col_letter].width = min(max(12, max_len + 2), 60)
 
+
 def set_percent_cell(cell, pct_value: Optional[float]):
     if pct_value is None:
         cell.value = None
@@ -634,6 +643,7 @@ def set_percent_cell(cell, pct_value: Optional[float]):
     cell.value = float(pct_value) / 100.0
     cell.number_format = "0%"
     cell.alignment = Alignment(horizontal="center", vertical="center")
+
 
 def build_slot_workbook_percent(rows: List[Dict[str, Any]]) -> Workbook:
     wb = Workbook()
@@ -683,9 +693,7 @@ def build_slot_workbook_percent(rows: List[Dict[str, Any]]) -> Workbook:
     autosize_columns(ws)
     return wb
 
-# =========================
-# MAIN
-# =========================
+
 def main():
     if not SHARED_DRIVE_NAME:
         raise RuntimeError("SHARED_DRIVE_NAME is required. Example: SHARED_DRIVE_NAME=2026_Shared_Drive")
@@ -703,7 +711,6 @@ def main():
 
     print(f"[INFO] Using Shared Drive: {shared_drive['name']} ({shared_drive_id})")
 
-    # --- SOURCE ROOT ---
     if ROOT_2026_FOLDER_ID:
         print(f"[ROOT] Using ROOT_2026_FOLDER_ID={ROOT_2026_FOLDER_ID}")
         base_root = drive_get_file(service, ROOT_2026_FOLDER_ID)
@@ -734,7 +741,6 @@ def main():
         base_root = pick_best_named_folder(candidates_root)
         print(f"[ROOT] Using source folder: {base_root['name']} (id={base_root['id']})")
 
-    # --- OUTPUT ROOT ---
     if OUTPUT_ROOT_FOLDER_ID:
         print(f"[ROOT] Using OUTPUT_ROOT_FOLDER_ID={OUTPUT_ROOT_FOLDER_ID}")
         output_root = drive_get_file(service, OUTPUT_ROOT_FOLDER_ID)
@@ -834,6 +840,7 @@ def main():
         drive_grant_editor_access(service, uploaded_file_id, EDITOR_EMAILS)
 
     time.sleep(SLEEP_BETWEEN_UPLOADS_SEC)
+
 
 if __name__ == "__main__":
     main()

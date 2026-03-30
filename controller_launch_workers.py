@@ -2,6 +2,7 @@ import os
 import time
 import random
 import base64
+import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -10,12 +11,10 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from googleapiclient.errors import HttpError
 
-# ---------------------------
-# Config
-# ---------------------------
 ROOT_2026_FOLDER_NAME = os.getenv("ROOT_2026_FOLDER_NAME", "2026").strip()
 ROOT_2026_FOLDER_ID = os.getenv("ROOT_2026_FOLDER_ID", "").strip()
 SHARED_DRIVE_NAME = os.getenv("SHARED_DRIVE_NAME", "").strip()
+SLOT_CHOICE = os.getenv("SLOT_CHOICE", "").strip()
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
@@ -57,16 +56,14 @@ USE_SHUTDOWN_TERMINATE = os.getenv("USE_SHUTDOWN_TERMINATE", "1").strip().lower(
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 6
 
-# ---------------------------
-# Helpers: SSM fetch
-# ---------------------------
+_SLOT_PREFIX_RE = re.compile(r"^\s*(\d+)\.\s*")
+
+
 def ssm_get(ssm, name: str, with_decryption: bool = True) -> str:
     resp = ssm.get_parameter(Name=name, WithDecryption=with_decryption)
     return resp["Parameter"]["Value"]
 
-# ---------------------------
-# Retry helpers
-# ---------------------------
+
 def drive_execute(req, label: str = "Drive API call"):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -87,16 +84,15 @@ def drive_execute(req, label: str = "Drive API call"):
                 continue
             raise
 
-# ---------------------------
-# Drive helpers
-# ---------------------------
+
 def _escape_drive_q_value(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
-def _slot_sort_key(name: str):
-    import re
-    m = re.search(r"(\d+)", name or "")
-    return (int(m.group(1)) if m else float("inf"), (name or "").lower())
+
+def extract_slot_prefix(name: str) -> Optional[int]:
+    m = _SLOT_PREFIX_RE.match(name or "")
+    return int(m.group(1)) if m else None
+
 
 def _list_kwargs_for_drive(drive_id: Optional[str] = None) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {
@@ -109,6 +105,7 @@ def _list_kwargs_for_drive(drive_id: Optional[str] = None) -> Dict[str, Any]:
     else:
         kwargs["corpora"] = "allDrives"
     return kwargs
+
 
 def list_shared_drives(service) -> List[dict]:
     out = []
@@ -123,6 +120,7 @@ def list_shared_drives(service) -> List[dict]:
         if not page_token:
             break
     return out
+
 
 def get_shared_drive_by_name(service, drive_name: str) -> dict:
     drives = list_shared_drives(service)
@@ -140,6 +138,7 @@ def get_shared_drive_by_name(service, drive_name: str) -> dict:
 
     return matches[0]
 
+
 def drive_get_file(service, file_id: str) -> dict:
     return drive_execute(
         service.files().get(
@@ -149,6 +148,7 @@ def drive_get_file(service, file_id: str) -> dict:
         ),
         label=f"get file {file_id}",
     )
+
 
 def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
@@ -174,6 +174,7 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
         if not page_token:
             break
 
+
 def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None, drive_id: Optional[str] = None):
     safe_name = _escape_drive_q_value(name)
     q_parts = [f"'{parent_id}' in parents", "trashed = false", f"name = '{safe_name}'"]
@@ -194,6 +195,7 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
     if not files:
         return None
     return sorted(files, key=lambda x: x.get("modifiedTime") or "", reverse=True)[0]
+
 
 def drive_search_folder_anywhere_in_shared_drive(service, folder_name: str, drive_id: str) -> List[dict]:
     safe_name = _escape_drive_q_value(folder_name)
@@ -218,6 +220,7 @@ def drive_search_folder_anywhere_in_shared_drive(service, folder_name: str, driv
             break
     return out
 
+
 def is_video_name(name: str) -> bool:
     p = Path(name)
     if p.name.startswith("."):
@@ -228,12 +231,19 @@ def is_video_name(name: str) -> bool:
         return False
     return True
 
+
 def transcript_output_name(video_name: str) -> str:
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
 
-# ---------------------------
-# Drive auth (service account + delegation)
-# ---------------------------
+
+def eval_json(text: str) -> Dict[str, Any]:
+    import json
+    try:
+        return json.loads(text)
+    except Exception as e:
+        raise RuntimeError(f"Invalid service account JSON from SSM: {e}")
+
+
 def build_drive_service(service_account_json_text: str):
     if AUTH_MODE != "service_account":
         raise RuntimeError(f"Unsupported AUTH_MODE='{AUTH_MODE}'. Use AUTH_MODE=service_account")
@@ -253,16 +263,7 @@ def build_drive_service(service_account_json_text: str):
 
     return build("drive", "v3", credentials=creds)
 
-def eval_json(text: str) -> Dict[str, Any]:
-    import json
-    try:
-        return json.loads(text)
-    except Exception as e:
-        raise RuntimeError(f"Invalid service account JSON from SSM: {e}")
 
-# ---------------------------
-# Worker UserData template (FULL)
-# ---------------------------
 WORKER_USERDATA_TEMPLATE = r"""#!/bin/bash
 set -euo pipefail
 
@@ -365,9 +366,54 @@ else
 fi
 """
 
-# ---------------------------
-# Find pending video tasks
-# ---------------------------
+
+def list_slot_folders(service, slots_parent_id: str, drive_id: str) -> List[dict]:
+    folders = list(drive_list_children(service, slots_parent_id, FOLDER_MIME, drive_id))
+    out = []
+
+    for f in folders:
+        slot_no = extract_slot_prefix(f.get("name", ""))
+        if slot_no is not None:
+            item = dict(f)
+            item["_slot_no"] = slot_no
+            out.append(item)
+
+    return sorted(out, key=lambda x: (x["_slot_no"], (x.get("name") or "").lower()))
+
+
+def choose_slot(service, slots_parent_id: str, drive_id: str) -> dict:
+    slots = list_slot_folders(service, slots_parent_id, drive_id)
+    if not slots:
+        raise RuntimeError("No numbered slot folders found under 2026.")
+
+    if SLOT_CHOICE.isdigit():
+        wanted_slot_no = int(SLOT_CHOICE)
+        for s in slots:
+            if s["_slot_no"] == wanted_slot_no:
+                print(f"[AUTO] Using SLOT_CHOICE={wanted_slot_no}: {s['name']}")
+                return s
+        available = ", ".join(str(s["_slot_no"]) for s in slots)
+        raise RuntimeError(f"SLOT_CHOICE '{wanted_slot_no}' not found. Available folder numbers: {available}")
+
+    print("\n" + "=" * 80)
+    print("SELECT SLOT TO PROCESS")
+    print("=" * 80)
+    for s in slots:
+        print(f"  {s['_slot_no']:2}. {s['name']}")
+    print("  EXIT - Exit\n")
+
+    while True:
+        choice = input("Choose slot number (e.g. 8 or 9) or EXIT: ").strip().lower()
+        if choice == "exit":
+            raise SystemExit(0)
+        if choice.isdigit():
+            wanted_slot_no = int(choice)
+            for s in slots:
+                if s["_slot_no"] == wanted_slot_no:
+                    return s
+        print("Invalid choice. Try again.")
+
+
 def find_pending_tasks(drive) -> List[Dict]:
     if not SHARED_DRIVE_NAME:
         raise RuntimeError("SHARED_DRIVE_NAME is required.")
@@ -396,22 +442,7 @@ def find_pending_tasks(drive) -> List[Dict]:
         root = roots[0]
 
     root_id = root["id"]
-
-    slot_choice = os.getenv("SLOT_CHOICE", "1").strip()
-    slot_folders = sorted(
-        list(drive_list_children(drive, root_id, FOLDER_MIME, shared_drive_id)),
-        key=lambda x: _slot_sort_key(x.get("name") or ""),
-    )
-    if not slot_folders:
-        raise RuntimeError("No slot folders found under 2026.")
-
-    if slot_choice.isdigit():
-        idx = int(slot_choice)
-        if not (1 <= idx <= len(slot_folders)):
-            raise RuntimeError(f"SLOT_CHOICE out of range (1..{len(slot_folders)})")
-        slot = slot_folders[idx - 1]
-    else:
-        slot = slot_folders[0]
+    slot = choose_slot(drive, root_id, shared_drive_id)
 
     people = sorted(
         list(drive_list_children(drive, slot["id"], FOLDER_MIME, shared_drive_id)),
@@ -445,9 +476,7 @@ def find_pending_tasks(drive) -> List[Dict]:
 
     return tasks
 
-# ---------------------------
-# EC2 Launch
-# ---------------------------
+
 def launch_worker(ec2, task: Dict) -> str:
     userdata = WORKER_USERDATA_TEMPLATE.format(
         VIDEO_FILE_ID=task["video_file_id"],
@@ -491,6 +520,7 @@ def launch_worker(ec2, task: Dict) -> str:
                 continue
             raise
 
+
 def main():
     if not LAUNCH_TEMPLATE_ID:
         raise RuntimeError("Missing WORKER_LAUNCH_TEMPLATE_ID env var.")
@@ -522,6 +552,7 @@ def main():
         time.sleep(LAUNCH_SLEEP_SECONDS)
 
     print(f"[DONE] Launched {launched} worker instances")
+
 
 if __name__ == "__main__":
     main()

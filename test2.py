@@ -1,26 +1,4 @@
 #!/usr/bin/env python3
-"""
-================================================================================
-FULLY FIXED Transcription Script - Shared Drive + Domain-Wide Delegation
-================================================================================
-
-FIXES IN THIS VERSION:
-1. ✓ Service account uploads now go to SHARED DRIVE (not My Drive)
-2. ✓ Proper parent_id tracking through Shared Drive hierarchy
-3. ✓ supportsAllDrives=true on ALL API calls (list, read, write)
-4. ✓ Better folder resolution with Shared Drive support
-5. ✓ Clear logging of which drive/folder is being used
-
-REQUIREMENTS:
-- Service account MUST be a member of the Shared Drive
-- USE_SHARED_DRIVES=true in .env
-- The 2026 folder structure MUST exist in the Shared Drive
-
-Author: TechSara Solutions
-Email: techsphere@techsarasolutions.com
-Date: 2026-03-21
-================================================================================
-"""
 
 import os
 import io
@@ -39,8 +17,6 @@ from pathlib import Path
 from typing import Optional, List, Tuple, Generator
 
 from dotenv import load_dotenv
-
-# Google API imports
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
@@ -48,30 +24,22 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
-# ==============================================================================
-# CONFIGURATION
-# ==============================================================================
-
 SERVICE_ACCOUNT_FILE = Path(os.getenv("SERVICE_ACCOUNT_FILE") or "service-account.json")
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
-# Root / folder settings
 ROOT_2026_FOLDER_NAME = (os.getenv("ROOT_2026_FOLDER_NAME") or "2026").strip()
 SHARED_DRIVE_NAME = (os.getenv("SHARED_DRIVE_NAME") or "2026_Shared_Drive").strip()
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
-# Shared drives / delegation (MUST USE ONE)
 USE_SHARED_DRIVES = (os.getenv("USE_SHARED_DRIVES") or "").strip().lower() in ("1", "true", "yes", "y")
 USE_DELEGATION = (os.getenv("USE_DELEGATION") or "").strip().lower() in ("1", "true", "yes", "y")
 DELEGATED_USER_EMAIL = (os.getenv("DELEGATED_USER_EMAIL") or "").strip()
 
-# Slot / mode settings
 SLOT_CHOICE_ENV = (os.getenv("SLOT_CHOICE") or "6").strip()
 VIDEO_FILE_ID = (os.getenv("VIDEO_FILE_ID") or "").strip()
 TARGET_FOLDER_ID = (os.getenv("TARGET_FOLDER_ID") or "").strip()
 VIDEO_NAME_ENV = (os.getenv("VIDEO_NAME") or "").strip()
 
-# Transcription settings
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 TRANSCRIPT_SUFFIX = "_transcripts.txt"
 
@@ -92,20 +60,14 @@ CHUNK_SECONDS = int((os.getenv("CHUNK_SECONDS") or "540").strip())
 OVERLAP_SECONDS = int((os.getenv("OVERLAP_SECONDS") or "2").strip())
 FORCE_RETRANSCRIBE = (os.getenv("FORCE_RETRANSCRIBE") or "").strip().lower() in ("1", "true", "yes", "y")
 
-# Whisper settings
 WHISPER_MODEL = (os.getenv("WHISPER_MODEL") or "large-v3").strip()
 DEVICE = (os.getenv("DEVICE") or "cpu").strip()
 COMPUTE_TYPE = (os.getenv("COMPUTE_TYPE") or ("float16" if DEVICE == "cuda" else "int8")).strip()
 LANGUAGE = (os.getenv("LANGUAGE") or "en").strip()
 USE_VAD = (os.getenv("USE_VAD") or "true").strip().lower() in ("1", "true", "yes", "y")
 
-# Retry config
 MAX_RETRIES = int((os.getenv("MAX_RETRIES") or "8").strip())
 BASE_SLEEP = float((os.getenv("BASE_SLEEP") or "1.0").strip())
-
-# ==============================================================================
-# WINDOWS-SAFE FILENAMES
-# ==============================================================================
 
 _WINDOWS_FORBIDDEN = r'<>:"/\\|?*'
 _WINDOWS_RESERVED = {
@@ -114,9 +76,10 @@ _WINDOWS_RESERVED = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 
+_SLOT_PREFIX_RE = re.compile(r"^\s*(\d+)\.\s*")
+
 
 def safe_local_filename(name: str, fallback: str = "file.bin") -> str:
-    """Make filename safe for Windows and other systems."""
     name = (name or "").strip() or fallback
     name = re.sub(f"[{re.escape(_WINDOWS_FORBIDDEN)}]", "_", name)
     name = re.sub(r"\s+", " ", name).strip()
@@ -135,16 +98,10 @@ def safe_local_filename(name: str, fallback: str = "file.bin") -> str:
 
 
 def transcript_output_name(video_name: str) -> str:
-    """Generate transcript filename from video name."""
     return f"{Path(video_name).stem}{TRANSCRIPT_SUFFIX}"
 
 
-# ==============================================================================
-# AUTHENTICATION
-# ==============================================================================
-
 def validate_env():
-    """Validate required environment setup."""
     if not SERVICE_ACCOUNT_FILE.exists():
         raise FileNotFoundError(
             f"\n❌ Service account file not found: {SERVICE_ACCOUNT_FILE}\n"
@@ -174,11 +131,6 @@ def validate_env():
 
 
 def get_drive_service(user_email: Optional[str] = None):
-    """
-    Authenticate with Google Drive using Service Account.
-
-    If user_email is provided, uses domain-wide delegation to impersonate that user.
-    """
     print("\n" + "=" * 80)
     print("AUTHENTICATION")
     print("=" * 80)
@@ -192,28 +144,23 @@ def get_drive_service(user_email: Optional[str] = None):
 
     if user_email:
         creds = creds.with_subject(user_email)
-        print(f"[INFO] Mode: Domain-Wide Delegation")
+        print("[INFO] Mode: Domain-Wide Delegation")
         print(f"[INFO] Impersonating User: {user_email}")
     else:
-        print(f"[INFO] Mode: Raw Service Account")
+        print("[INFO] Mode: Raw Service Account")
 
     if USE_SHARED_DRIVES:
         print(f"[INFO] Using Shared Drive: {SHARED_DRIVE_NAME}")
-        print(f"[INFO] Service account MUST be a member of this Shared Drive")
+        print("[INFO] Service account MUST be a member of this Shared Drive")
     else:
-        print(f"[INFO] Using My Drive (via delegation)")
+        print("[INFO] Using My Drive (via delegation)")
 
     service = build("drive", "v3", credentials=creds)
     print("[✓] Drive authentication successful\n")
     return service
 
 
-# ==============================================================================
-# RETRY / ERROR HANDLING
-# ==============================================================================
-
 def is_storage_quota_error(e: Exception) -> bool:
-    """Check if error is due to service account storage quota."""
     if isinstance(e, HttpError):
         msg = str(e).lower()
         return ("storage quota" in msg) or ("storagequotaexceeded" in msg)
@@ -221,7 +168,6 @@ def is_storage_quota_error(e: Exception) -> bool:
 
 
 def is_transient_error(e: Exception) -> bool:
-    """Check if an error is retryable."""
     if isinstance(e, HttpError):
         status = getattr(e.resp, "status", None)
         if status in (429, 500, 502, 503, 504):
@@ -265,16 +211,15 @@ def is_transient_error(e: Exception) -> bool:
 
 
 def execute_with_retries(request, *, max_retries: int = MAX_RETRIES, base_sleep: float = BASE_SLEEP):
-    """Execute Google API request with retry logic."""
     for attempt in range(max_retries):
         try:
             return request.execute()
         except Exception as e:
             if is_storage_quota_error(e):
-                print(f"\n[ERROR] Storage Quota Error!")
-                print(f"[ERROR] This means uploads are going to My Drive instead of Shared Drive")
-                print(f"[ERROR] Fix: Ensure 2026 folder is INSIDE the Shared Drive, not in My Drive")
-                print(f"[ERROR] Also verify: USE_SHARED_DRIVES=true in .env")
+                print("\n[ERROR] Storage Quota Error!")
+                print("[ERROR] This means uploads are going to My Drive instead of Shared Drive")
+                print("[ERROR] Fix: Ensure 2026 folder is INSIDE the Shared Drive, not in My Drive")
+                print("[ERROR] Also verify: USE_SHARED_DRIVES=true in .env")
                 raise
 
             if is_transient_error(e):
@@ -291,13 +236,7 @@ def execute_with_retries(request, *, max_retries: int = MAX_RETRIES, base_sleep:
             raise
 
 
-# ==============================================================================
-# TEMP FILE HANDLING
-# ==============================================================================
-
 class SafeTemporaryDirectory:
-    """Temporary directory wrapper with Windows-safe cleanup."""
-
     def __init__(self):
         self.path = Path(tempfile.mkdtemp())
         print(f"[INFO] Created temp directory: {self.path}")
@@ -308,13 +247,13 @@ class SafeTemporaryDirectory:
 
         try:
             shutil.rmtree(str(self.path))
-            print(f"[INFO] Cleaned up temp directory")
+            print("[INFO] Cleaned up temp directory")
         except PermissionError:
-            print(f"[WARN] Files locked in temp directory, retrying...")
+            print("[WARN] Files locked in temp directory, retrying...")
             time.sleep(0.5)
             try:
                 shutil.rmtree(str(self.path), ignore_errors=True)
-                print(f"[INFO] Cleaned up temp directory (forced)")
+                print("[INFO] Cleaned up temp directory (forced)")
             except Exception:
                 print(f"[WARN] Could not fully clean temp directory: {self.path}")
 
@@ -325,16 +264,11 @@ class SafeTemporaryDirectory:
         self.cleanup()
 
 
-# ==============================================================================
-# DRIVE HELPERS - WITH PROPER SHARED DRIVE SUPPORT
-# ==============================================================================
-
 def _escape_drive_q_value(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def _list_kwargs():
-    """Always return supportsAllDrives for consistency."""
     return {
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
@@ -343,17 +277,14 @@ def _list_kwargs():
 
 
 def _read_kwargs():
-    """Always return supportsAllDrives for consistency."""
     return {"supportsAllDrives": True}
 
 
 def _write_kwargs():
-    """Always return supportsAllDrives for consistency."""
     return {"supportsAllDrives": True}
 
 
 def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None) -> Generator[dict, None, None]:
-    """Yield all children for a folder (works on Shared Drive)."""
     q_parts = [f"'{parent_id}' in parents", "trashed = false"]
     if mime_type:
         q_parts.append(f"mimeType = '{_escape_drive_q_value(mime_type)}'")
@@ -379,7 +310,6 @@ def drive_list_children(service, parent_id: str, mime_type: Optional[str] = None
 
 
 def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str] = None):
-    """Find file/folder by exact name inside a given parent (Shared Drive compatible)."""
     q_parts = [
         f"'{parent_id}' in parents",
         f"name = '{_escape_drive_q_value(name)}'",
@@ -402,7 +332,6 @@ def drive_find_child(service, parent_id: str, name: str, mime_type: Optional[str
 
 
 def drive_get_file_meta(service, file_id: str):
-    """Get file metadata."""
     return execute_with_retries(
         service.files().get(
             fileId=file_id,
@@ -413,7 +342,6 @@ def drive_get_file_meta(service, file_id: str):
 
 
 def drive_download_file(service, file_id: str, dest_path: Path):
-    """Download Drive file to local path."""
     request = service.files().get_media(fileId=file_id, **_read_kwargs())
     with io.FileIO(str(dest_path), "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 8)
@@ -440,7 +368,6 @@ def drive_download_file(service, file_id: str, dest_path: Path):
 
 
 def drive_upload_text(service, parent_id: str, filename: str, local_path: Path):
-    """Upload or update a text file in Drive (Shared Drive compatible)."""
     existing = drive_find_child(service, parent_id, filename, None)
     media = MediaFileUpload(str(local_path), mimetype="text/plain", resumable=True)
 
@@ -467,7 +394,6 @@ def drive_upload_text(service, parent_id: str, filename: str, local_path: Path):
 
 
 def find_shared_drive(service, drive_name: str) -> Optional[dict]:
-    """Find a Shared Drive by name."""
     page_token = None
     while True:
         res = execute_with_retries(
@@ -489,7 +415,6 @@ def find_shared_drive(service, drive_name: str) -> Optional[dict]:
 
 
 def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
-    """Search for folders by exact name (works across Shared Drives)."""
     safe_name = _escape_drive_q_value(folder_name)
     q = f"name = '{safe_name}' and mimeType = '{FOLDER_MIME}' and trashed = false"
 
@@ -513,48 +438,60 @@ def drive_search_folder_anywhere(service, folder_name: str) -> List[dict]:
     return out
 
 
-# ==============================================================================
-# SLOT SELECTION
-# ==============================================================================
+def extract_slot_prefix(name: str) -> Optional[int]:
+    m = _SLOT_PREFIX_RE.match(name or "")
+    return int(m.group(1)) if m else None
+
 
 def list_slot_folders(service, slots_parent_id: str) -> List[dict]:
-    return sorted(
-        list(drive_list_children(service, slots_parent_id, FOLDER_MIME)),
-        key=lambda x: x["name"].lower()
-    )
+    folders = list(drive_list_children(service, slots_parent_id, FOLDER_MIME))
+    out = []
+
+    for f in folders:
+        slot_no = extract_slot_prefix(f["name"])
+        if slot_no is not None:
+            item = dict(f)
+            item["_slot_no"] = slot_no
+            out.append(item)
+
+    return sorted(out, key=lambda x: (x["_slot_no"], x["name"].lower()))
 
 
 def choose_slot(service, slots_parent_id: str) -> dict:
     slots = list_slot_folders(service, slots_parent_id)
     if not slots:
-        raise RuntimeError("No slot folders found under the root folder.")
+        raise RuntimeError("No numbered slot folders found under the root folder.")
 
     if SLOT_CHOICE_ENV.isdigit():
-        idx = int(SLOT_CHOICE_ENV)
-        if 1 <= idx <= len(slots):
-            chosen = slots[idx - 1]
-            print(f"[AUTO] Using SLOT_CHOICE={idx}: {chosen['name']}")
-            return chosen
-        raise RuntimeError(f"SLOT_CHOICE '{SLOT_CHOICE_ENV}' is out of range (1..{len(slots)}).")
+        wanted_slot_no = int(SLOT_CHOICE_ENV)
+        for s in slots:
+            if s["_slot_no"] == wanted_slot_no:
+                print(f"[AUTO] Using SLOT_CHOICE={wanted_slot_no}: {s['name']}")
+                return s
+
+        available = ", ".join(str(s["_slot_no"]) for s in slots)
+        raise RuntimeError(
+            f"SLOT_CHOICE '{wanted_slot_no}' not found. "
+            f"Available folder numbers: {available}"
+        )
 
     print("\nAvailable slots:")
-    for i, s in enumerate(slots, start=1):
-        print(f"  {i:2}. {s['name']}")
+    for s in slots:
+        print(f"  {s['_slot_no']:2}. {s['name']}")
 
     while True:
-        choice = input("Choose slot number (e.g. 1) or EXIT: ").strip().lower()
+        choice = input("Choose slot number (e.g. 8 or 9) or EXIT: ").strip().lower()
         if choice == "exit":
             raise SystemExit(0)
+
         if choice.isdigit():
-            idx = int(choice)
-            if 1 <= idx <= len(slots):
-                return slots[idx - 1]
+            wanted_slot_no = int(choice)
+            for s in slots:
+                if s["_slot_no"] == wanted_slot_no:
+                    return s
+
         print("Invalid choice. Try again.")
 
-
-# ==============================================================================
-# AUDIO HELPERS
-# ==============================================================================
 
 def is_video_name(name: str) -> bool:
     p = Path(name)
@@ -568,7 +505,6 @@ def is_video_name(name: str) -> bool:
 
 
 def extract_audio_wav(video_path: Path, wav_path: Path):
-    """Extract mono 16k WAV audio from video using ffmpeg."""
     proc = subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "16000", str(wav_path)],
         stdout=subprocess.PIPE,
@@ -585,7 +521,6 @@ def wav_duration_seconds(wav_path: Path) -> float:
 
 
 def split_audio(wav_path: Path, chunk_seconds: int, overlap_seconds: int) -> List[Tuple[Path, float, float]]:
-    """Split WAV into overlapping chunks."""
     total_seconds = wav_duration_seconds(wav_path)
     chunks: List[Tuple[Path, float, float]] = []
 
@@ -618,12 +553,7 @@ def fmt_ts(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
-# ==============================================================================
-# WHISPER
-# ==============================================================================
-
 def get_whisper_model():
-    """Load Faster-Whisper model."""
     from faster_whisper import WhisperModel
 
     try:
@@ -636,7 +566,6 @@ def get_whisper_model():
 
 
 def transcribe_with_faster_whisper(model, wav_path: Path) -> List[Tuple[float, str]]:
-    """Transcribe WAV and return list of (start_seconds, text)."""
     lang = LANGUAGE if LANGUAGE else None
 
     segments, _info = model.transcribe(
@@ -656,12 +585,7 @@ def transcribe_with_faster_whisper(model, wav_path: Path) -> List[Tuple[float, s
     return out
 
 
-# ==============================================================================
-# PROCESS SINGLE VIDEO
-# ==============================================================================
-
 def process_one_video(service, whisper_model, video_file_id: str, target_folder_id: str, video_name: str = ""):
-    """Download, transcribe, and upload transcript for one video."""
     print("\n" + "=" * 80)
 
     meta = drive_get_file_meta(service, video_file_id)
@@ -727,18 +651,12 @@ def process_one_video(service, whisper_model, video_file_id: str, target_folder_
         print("=" * 80)
 
 
-# ==============================================================================
-# FULL SCAN MODE
-# ==============================================================================
-
 def resolve_service():
-    """Create Drive service using configured auth mode."""
     delegated_user = DELEGATED_USER_EMAIL if USE_DELEGATION else None
     return get_drive_service(delegated_user)
 
 
 def main_full_scan():
-    """Scan slot folders and process all matching videos."""
     service = resolve_service()
     whisper_model = get_whisper_model()
 
@@ -746,7 +664,6 @@ def main_full_scan():
     print("FULL SCAN MODE - PROCESSING ALL VIDEOS")
     print("=" * 80)
 
-    # STEP 1: Find or navigate to Shared Drive
     if USE_SHARED_DRIVES:
         print(f"\n[SEARCH] Looking for Shared Drive: '{SHARED_DRIVE_NAME}'")
         shared_drive = find_shared_drive(service, SHARED_DRIVE_NAME)
@@ -761,7 +678,6 @@ def main_full_scan():
         root_id = shared_drive["id"]
         print(f"[FOUND] Shared Drive: {shared_drive['name']} ({root_id})")
     else:
-        # Fall back to searching for 2026 folder
         print(f"\n[SEARCH] Looking for root folder: '{ROOT_2026_FOLDER_NAME}'")
         candidates = drive_search_folder_anywhere(service, ROOT_2026_FOLDER_NAME)
         if not candidates:
@@ -771,7 +687,6 @@ def main_full_scan():
         root_id = root_folder["id"]
         print(f"[FOUND] Root folder: {root_folder['name']} ({root_id})")
 
-    # STEP 2: Find 2026 folder inside Shared Drive
     root_2026 = drive_find_child(service, root_id, ROOT_2026_FOLDER_NAME, FOLDER_MIME)
     if not root_2026:
         raise RuntimeError(
@@ -781,7 +696,6 @@ def main_full_scan():
     root_2026_id = root_2026["id"]
     print(f"[FOUND] 2026 folder: {root_2026['name']} ({root_2026_id})")
 
-    # STEP 3: Choose slot
     slot = choose_slot(service, root_2026_id)
     print(f"[SELECTED] Slot: {slot['name']}")
 
@@ -819,10 +733,6 @@ def main_full_scan():
             for vid in videos:
                 process_one_video(service, whisper_model, vid["id"], folder_id, vid["name"])
 
-
-# ==============================================================================
-# MAIN
-# ==============================================================================
 
 def main():
     validate_env()
